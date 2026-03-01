@@ -42,12 +42,6 @@ EVENT_COLORS = {
 }
 
 
-def format_bytes(n: int) -> str:
-    if n >= 1024:
-        return f"{n / 1024:.1f}kB"
-    return f"{n}B"
-
-
 def format_tokens(tok_in, tok_out) -> str:
     def _fmt(n):
         if n >= 1000:

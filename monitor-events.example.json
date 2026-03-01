@@ -1,21 +1,8 @@
 // @thinkpad dispatches a task to @mac: "What OS version are you running?"
-// Full lifecycle: write task -> request -> claim -> execute -> response
+// Full lifecycle: request -> execute -> response
 
-// 1. Task file written to MCP memory
-{"id": 50, "action": "request", "tool": "write_memory", "resource": "task-20260301-1335-mac-test.md", "bytes": 193, "from": "thinkpad", "ts": "2026-03-01T13:35:25Z"}
-
-// 2. Request sent to @mac via SSE
+// 1. @thinkpad sends request to @mac
 {"id": 51, "action": "request", "from": "thinkpad", "to": "mac", "status": "pending", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:25Z"}
 
-// 3. @mac claims the task
-{"id": 52, "action": "request", "tool": "read_memory", "resource": "task-20260301-1335-mac-test.md", "from": "mac", "ts": "2026-03-01T13:35:25Z"}
-{"id": 54, "action": "request", "tool": "edit_memory", "resource": "task-20260301-1335-mac-test.md", "from": "mac", "ts": "2026-03-01T13:35:25Z"}
-
-// 4. @mac executes and writes result
-{"id": 71, "action": "request", "tool": "edit_memory", "resource": "task-20260301-1335-mac-test.md", "from": "mac", "ts": "2026-03-01T13:35:35Z"}
-
-// 5. Response: @mac notifies @thinkpad the task is done
+// 2. @mac completes the task and sends response
 {"id": 77, "action": "response", "from": "mac", "to": "thinkpad", "status": "completed", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:36Z"}
-
-// 6. @thinkpad reads the result
-{"id": 78, "action": "request", "tool": "read_memory", "resource": "task-20260301-1335-mac-test.md", "from": "thinkpad", "ts": "2026-03-01T13:35:36Z"}
