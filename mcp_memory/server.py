@@ -99,9 +99,13 @@ def _client_fields(ctx: Context) -> dict:
     fields = {}
     if cid:
         fields["client"] = cid
-        device = _resolve_device(cid)
-        if device:
-            fields["device"] = device
+        devices = _load_devices()
+        entry = devices.get(cid, {})
+        if entry.get("name"):
+            fields["device"] = entry["name"]
+        # Determine if this is a daemon or user session
+        # Daemon entries have a "daemon" field in devices.json
+        fields["is_daemon"] = bool(entry.get("daemon"))
     return fields
 
 
@@ -361,15 +365,23 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         except Exception:
             pass
 
+    device_name = cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown")
+    if cf.get("is_daemon"):
+        sender = "@" + device_name
+    else:
+        sender = "howlingfantods_"
     evt = {
         "action": action,
         "tool": "notify_agent",
         "task": task_id,
-        "from": "@" + cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
+        "from": sender,
         "to": "@" + agent_id,
+        "on": "@" + device_name if device_name else None,
         "status": status,
         "online": online,
     }
+    if not evt["on"]:
+        del evt["on"]
     if query:
         evt["query"] = query
     if action == "response":

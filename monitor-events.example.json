@@ -1,11 +1,17 @@
-// @thinkpad dispatches a task to @mac: "What OS version are you running?"
+// howlingfantods_ dispatches a task to @mac from @thinkpad
 // Full lifecycle: request -> execute -> response
 
-// 1. @thinkpad sends request to @mac
-{"id": 51, "action": "request", "tool": "notify_agent", "from": "@thinkpad", "to": "@mac", "status": "pending", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:25Z"}
+// 1. User sends request to @mac (from @thinkpad)
+{"id": 51, "action": "request", "tool": "notify_agent", "from": "howlingfantods_", "to": "@mac", "on": "@thinkpad", "status": "pending", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:25Z"}
 
-// 2a. Success
-{"id": 77, "action": "response", "tool": "notify_agent", "from": "@mac", "to": "@thinkpad", "status": "completed", "query": "What OS version are you running?", "errors": [], "online": true, "ts": "2026-03-01T13:35:36Z"}
+// 2a. Success: @mac responds
+{"id": 77, "action": "response", "tool": "notify_agent", "from": "@mac", "to": "howlingfantods_", "on": "@mac", "status": "completed", "query": "What OS version are you running?", "errors": [], "online": true, "ts": "2026-03-01T13:35:36Z"}
 
-// 2b. Failure
-{"id": 77, "action": "response", "tool": "notify_agent", "from": "@mac", "to": "@thinkpad", "status": "failed", "query": "What OS version are you running?", "errors": ["claude --print timed out after 300s"], "online": true, "ts": "2026-03-01T13:40:25Z"}
+// 2b. Failure: @mac could not complete
+{"id": 77, "action": "response", "tool": "notify_agent", "from": "@mac", "to": "howlingfantods_", "on": "@mac", "status": "failed", "query": "What OS version are you running?", "errors": ["claude --print timed out after 300s"], "online": true, "ts": "2026-03-01T13:40:25Z"}
+
+// Agent-to-agent: @thinkpad daemon dispatches to @vps
+{"id": 90, "action": "request", "tool": "notify_agent", "from": "@thinkpad", "to": "@vps", "on": "@thinkpad", "status": "pending", "query": "Check disk usage", "online": true, "ts": "2026-03-01T14:00:00Z"}
+
+// @vps responds to @thinkpad
+{"id": 95, "action": "response", "tool": "notify_agent", "from": "@vps", "to": "@thinkpad", "on": "@vps", "status": "completed", "query": "Check disk usage", "errors": [], "online": true, "ts": "2026-03-01T14:00:12Z"}
