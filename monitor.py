@@ -105,7 +105,7 @@ def format_event(event: dict, use_color: bool) -> str:
             parts.append(f"q=\"{query}\"")
         return "  ".join(p for p in parts if p)
 
-    if etype in ("request", "response") and "tool" not in event:
+    if etype in ("request", "response"):
         eid = event.get("id", "")
         sender = event.get("from", "")
         receiver = event.get("to", "")
@@ -122,6 +122,13 @@ def format_event(event: dict, use_color: bool) -> str:
         if query:
             q = query if len(query) <= 80 else query[:77] + "..."
             parts.append(f"\"{q}\"")
+        error = event.get("error", "")
+        if error:
+            e = error if len(error) <= 80 else error[:77] + "..."
+            if use_color:
+                parts.append(f"{RED}error: {e}{RESET}")
+            else:
+                parts.append(f"error: {e}")
         return "  ".join(p for p in parts if p)
 
     if etype == "task":

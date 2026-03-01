@@ -2,7 +2,10 @@
 // Full lifecycle: request -> execute -> response
 
 // 1. @thinkpad sends request to @mac
-{"id": 51, "action": "request", "from": "thinkpad", "to": "mac", "status": "pending", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:25Z"}
+{"id": 51, "action": "request", "tool": "notify_agent", "from": "thinkpad", "to": "mac", "status": "pending", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:25Z"}
 
-// 2. @mac completes the task and sends response
-{"id": 77, "action": "response", "from": "mac", "to": "thinkpad", "status": "completed", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:36Z"}
+// 2a. Success: @mac completes the task
+{"id": 77, "action": "response", "tool": "notify_agent", "from": "mac", "to": "thinkpad", "status": "completed", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:35:36Z"}
+
+// 2b. Failure: @mac could not complete the task
+{"id": 77, "action": "response", "tool": "notify_agent", "from": "mac", "to": "thinkpad", "status": "failed", "error": "claude --print timed out after 300s", "query": "What OS version are you running?", "online": true, "ts": "2026-03-01T13:40:25Z"}

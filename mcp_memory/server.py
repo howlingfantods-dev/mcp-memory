@@ -325,6 +325,24 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
                     if status in ("completed", "failed"):
                         action = "response"
                     break
+            # Extract error from Result section on failure
+            if status == "failed":
+                in_result = False
+                result_lines = []
+                for rline in content.splitlines():
+                    if rline.strip().lower() in ("## result",):
+                        in_result = True
+                        continue
+                    if in_result:
+                        if rline.startswith("## ") or rline.startswith("# "):
+                            break
+                        result_lines.append(rline)
+                error_text = " ".join(result_lines).strip()
+                if error_text.startswith("_(") and error_text.endswith(")_"):
+                    error_text = error_text[2:-2]
+                if len(error_text) > 200:
+                    error_text = error_text[:197] + "..."
+
             for line in content.splitlines():
                 header = line.strip().lower()
                 if header in ("## request", "## prompt"):
@@ -352,6 +370,8 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     }
     if query:
         evt["query"] = query
+    if status == "failed" and "error_text" in dir() and error_text:
+        evt["error"] = error_text
     evt.update(cf)
     emit_monitor_event(evt)
 
