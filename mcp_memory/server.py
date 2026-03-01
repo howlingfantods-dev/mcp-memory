@@ -291,6 +291,29 @@ def emit_monitor_event(event: dict):
 
 
 @mcp.tool()
+def _set_task_target(content: str, agent_id: str) -> str:
+    """Set or replace the target field in a task file."""
+    lines = content.splitlines()
+    new_lines = []
+    found = False
+    for line in lines:
+        if line.strip().startswith("- target:"):
+            new_lines.append(f"- target: {agent_id}")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        # Insert before ## Request
+        final = []
+        for line in new_lines:
+            if line.strip().lower() in ("## request", "## prompt"):
+                final.append(f"- target: {agent_id}")
+                final.append("")
+            final.append(line)
+        new_lines = final
+    return "\n".join(new_lines)
+
+
 async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     """Send a notification to an agent about a new task.
 
@@ -298,10 +321,34 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     If the agent is offline, the task file remains pending and will be
     picked up when the agent reconnects.
 
+    Use agent_id="here" to broadcast to all connected agents.
+
     Args:
-        agent_id: Target agent ID (e.g. "legion", "thinkpad")
+        agent_id: Target agent ID (e.g. "thinkpad", "here" for all connected)
         task_id: Task filename to notify about (e.g. "task-20260301-1430-obs.md")
     """
+    # @here: broadcast to all connected agents
+    if agent_id == "here":
+        if not _agent_queues:
+            return "No agents are currently connected."
+        connected = list(_agent_queues.keys())
+        # Read the template task to clone per-agent
+        task_path = DATA_DIR / task_id
+        if not task_path.exists():
+            raise FileNotFoundError(f"Task file '{task_id}' not found.")
+        template = task_path.read_text()
+        results = []
+        for aid in connected:
+            agent_task_id = task_id.replace(".md", f"-{aid}.md").replace(".json", f"-{aid}.json")
+            agent_content = _set_task_target(template, aid)
+            agent_path = DATA_DIR / agent_task_id
+            agent_path.write_text(agent_content)
+            result = await notify_agent(aid, agent_task_id, ctx)
+            results.append(f"@{aid}: {result}")
+        # Remove the template task
+        task_path.unlink()
+        return f"Broadcast to {len(connected)} agents:\n" + "\n".join(results)
+
     reg_filename = f"agent-reg-{agent_id}.md"
     reg_path = DATA_DIR / reg_filename
     if not reg_path.exists():

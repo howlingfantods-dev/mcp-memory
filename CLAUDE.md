@@ -49,6 +49,7 @@ When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs"
    - Always include explicit allowed commands
 
 2. **Notify the agent** with `notify_agent("{agent_id}", "{task_filename}")`
+   - Use `notify_agent("here", "{task_filename}")` to broadcast to all connected agents
 
 3. **Tell the user** the task was dispatched and how to check results
 
