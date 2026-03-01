@@ -335,18 +335,22 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     queues = _agent_queues.get(agent_id, set())
     online = bool(queues)
     cf = _client_fields(ctx)
-    evt = {
-        "action": "notify",
-        "task": task_id,
-        "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
-        "to": agent_id,
-        "online": online,
-    }
-    # Include query preview from task file
+
+    # Determine request vs response from task status
+    action = "request"
+    status = "pending"
     task_path = DATA_DIR / task_id
+    query = ""
     if task_path.exists():
         try:
             content = task_path.read_text()
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- status:"):
+                    status = stripped[len("- status:"):].strip()
+                    if status in ("completed", "failed"):
+                        action = "response"
+                    break
             for line in content.splitlines():
                 header = line.strip().lower()
                 if header in ("## request", "## prompt"):
@@ -359,11 +363,20 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
                     query = " ".join(request_lines).strip()
                     if len(query) > 120:
                         query = query[:117] + "..."
-                    if query:
-                        evt["query"] = query
                     break
         except Exception:
             pass
+
+    evt = {
+        "action": action,
+        "task": task_id,
+        "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
+        "to": agent_id,
+        "status": status,
+        "online": online,
+    }
+    if query:
+        evt["query"] = query
     evt.update(cf)
     emit_monitor_event(evt)
 

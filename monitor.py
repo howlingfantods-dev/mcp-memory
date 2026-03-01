@@ -38,7 +38,8 @@ EVENT_COLORS = {
     "disconnect": RED,
     "task": YELLOW,
     "tool": CYAN,
-    "notify": DIM,
+    "request": YELLOW,
+    "response": GREEN,
 }
 
 
@@ -111,11 +112,24 @@ def format_event(event: dict, use_color: bool) -> str:
             parts.append(f"q=\"{query}\"")
         return "  ".join(p for p in parts if p)
 
-    if etype == "notify":
-        agent = event.get("agent", "")
+    if etype in ("request", "response"):
+        eid = event.get("id", "")
+        sender = event.get("from", "")
+        receiver = event.get("to", "")
         task = event.get("task", "")
+        status = event.get("status", "")
+        query = event.get("query", "")
         online = "online" if event.get("online") else "offline"
-        return f"{ts} {color}{label}{reset} {agent.ljust(14)} {task}  {online}{caller}"
+        id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
+        if use_color:
+            arrow = f"{BOLD}@{sender}{RESET} -> {BOLD}@{receiver}{RESET}"
+        else:
+            arrow = f"@{sender} -> @{receiver}"
+        parts = [f"{ts} {id_tag}{color}{label}{reset} {arrow}  {status}  {online}"]
+        if query:
+            q = query if len(query) <= 80 else query[:77] + "..."
+            parts.append(f"\"{q}\"")
+        return "  ".join(p for p in parts if p)
 
     if etype == "task":
         eid = event.get("id", "")
