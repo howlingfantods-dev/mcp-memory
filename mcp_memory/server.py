@@ -243,7 +243,7 @@ def agent_subscribe(agent_id: str) -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue()
     _agent_queues.setdefault(agent_id, set()).add(q)
     logger.info("Agent '%s' subscribed to SSE (%d listeners)", agent_id, len(_agent_queues[agent_id]))
-    emit_monitor_event({"action": "connect", "agent": agent_id})
+    emit_monitor_event({"action": "connect", "agent": "@" + agent_id})
     return q
 
 
@@ -253,7 +253,7 @@ def agent_unsubscribe(agent_id: str, q: asyncio.Queue):
         if not _agent_queues[agent_id]:
             del _agent_queues[agent_id]
     logger.info("Agent '%s' unsubscribed from SSE", agent_id)
-    emit_monitor_event({"action": "disconnect", "agent": agent_id})
+    emit_monitor_event({"action": "disconnect", "agent": "@" + agent_id})
 
 
 # ── Monitor event bus ─────────────────────────────────────────────────
@@ -365,8 +365,8 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         "action": action,
         "tool": "notify_agent",
         "task": task_id,
-        "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
-        "to": agent_id,
+        "from": "@" + cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
+        "to": "@" + agent_id,
         "status": status,
         "online": online,
     }

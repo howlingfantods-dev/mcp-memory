@@ -115,9 +115,9 @@ def format_event(event: dict, use_color: bool) -> str:
         online = "online" if event.get("online") else "offline"
         id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
         if use_color:
-            arrow = f"{BOLD}@{sender}{RESET} -> {BOLD}@{receiver}{RESET}"
+            arrow = f"{BOLD}{sender}{RESET} -> {BOLD}{receiver}{RESET}"
         else:
-            arrow = f"@{sender} -> @{receiver}"
+            arrow = f"{sender} -> {receiver}"
         parts = [f"{ts} {id_tag}{color}{label}{reset} {arrow}  {status}  {online}"]
         if query:
             q = query if len(query) <= 80 else query[:77] + "..."
@@ -137,7 +137,7 @@ def format_event(event: dict, use_color: bool) -> str:
         status = event.get("status", "")
         agent = event.get("agent", "")
         id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
-        parts = [f"{ts} {id_tag}{color}{label}{reset} {task.ljust(28)} {status.ljust(12)} @{agent}"]
+        parts = [f"{ts} {id_tag}{color}{label}{reset} {task.ljust(28)} {status.ljust(12)} {agent}"]
         if event.get("tokens_in") is not None:
             parts.append(format_tokens(event["tokens_in"], event["tokens_out"]))
         if event.get("cost_usd") is not None:
