@@ -10,6 +10,7 @@ from mcp.server.auth.settings import (
     ClientRegistrationOptions,
     RevocationOptions,
 )
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -77,8 +78,17 @@ def _resolve_device(client_id: str | None) -> str | None:
     return entry.get("name") if entry else None
 
 
+def _get_client_id(ctx: Context = None) -> str | None:
+    token = get_access_token()
+    if token:
+        return token.client_id
+    if ctx:
+        return ctx.client_id
+    return None
+
+
 def _client_fields(ctx: Context) -> dict:
-    cid = ctx.client_id
+    cid = _get_client_id(ctx)
     fields = {}
     if cid:
         fields["client"] = cid
@@ -340,7 +350,7 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
         ram: RAM spec
         gpu: GPU model
     """
-    cid = ctx.client_id if ctx else None
+    cid = _get_client_id(ctx)
     if not cid:
         return "Cannot register: no client_id available in this session."
 
