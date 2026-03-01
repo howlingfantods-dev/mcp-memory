@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.auth.settings import (
@@ -78,6 +80,7 @@ def read_memory(filename: str) -> str:
     path = _validate_filename(filename)
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
+    emit_monitor_event({"type": "tool", "tool": "read_memory", "file": filename})
     return path.read_text()
 
 
@@ -91,7 +94,31 @@ def write_memory(filename: str, content: str) -> str:
     """
     path = _validate_filename(filename)
     path.write_text(content)
+    emit_monitor_event({"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content)})
+    if filename.startswith("task-") and filename.endswith(".json"):
+        _emit_task_event(filename, content)
     return f"Wrote {len(content)} bytes to {filename}."
+
+
+def _emit_task_event(filename: str, content: str):
+    try:
+        task = json.loads(content)
+        evt = {"type": "task", "task": filename, "status": task.get("status", "")}
+        if task.get("target"):
+            evt["agent"] = task["target"]
+        # Look for log entries to find claiming/executing agent
+        log = task.get("log", [])
+        if log:
+            evt["agent"] = log[-1].get("agent", evt.get("agent", ""))
+        usage = task.get("usage")
+        if usage and task.get("status") in ("completed", "failed"):
+            evt["tokens_in"] = usage.get("input_tokens")
+            evt["tokens_out"] = usage.get("output_tokens")
+            evt["cost_usd"] = usage.get("cost_usd")
+            evt["duration_ms"] = usage.get("duration_ms")
+        emit_monitor_event(evt)
+    except (json.JSONDecodeError, Exception):
+        pass
 
 
 @mcp.tool()
@@ -111,6 +138,7 @@ def edit_memory(filename: str, old_text: str, new_text: str) -> str:
         raise ValueError(f"Text not found in '{filename}'.")
     new_content = content.replace(old_text, new_text, 1)
     path.write_text(new_content)
+    emit_monitor_event({"type": "tool", "tool": "edit_memory", "file": filename})
     return f"Replaced text in {filename}."
 
 
@@ -153,6 +181,7 @@ def delete_memory(filename: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     path.unlink()
+    emit_monitor_event({"type": "tool", "tool": "delete_memory", "file": filename})
     return f"Deleted {filename}."
 
 
@@ -164,20 +193,49 @@ _agent_queues: dict[str, set[asyncio.Queue]] = {}
 
 
 def agent_subscribe(agent_id: str) -> asyncio.Queue:
-    """Register an SSE listener for an agent. Called from the SSE endpoint."""
     q: asyncio.Queue = asyncio.Queue()
     _agent_queues.setdefault(agent_id, set()).add(q)
     logger.info("Agent '%s' subscribed to SSE (%d listeners)", agent_id, len(_agent_queues[agent_id]))
+    emit_monitor_event({"type": "connect", "agent": agent_id})
     return q
 
 
 def agent_unsubscribe(agent_id: str, q: asyncio.Queue):
-    """Remove an SSE listener. Called when the SSE connection drops."""
     if agent_id in _agent_queues:
         _agent_queues[agent_id].discard(q)
         if not _agent_queues[agent_id]:
             del _agent_queues[agent_id]
     logger.info("Agent '%s' unsubscribed from SSE", agent_id)
+    emit_monitor_event({"type": "disconnect", "agent": agent_id})
+
+
+# ── Monitor event bus ─────────────────────────────────────────────────
+
+_monitor_queues: set[asyncio.Queue] = set()
+
+
+def monitor_subscribe() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    _monitor_queues.add(q)
+    logger.info("Monitor client subscribed (%d total)", len(_monitor_queues))
+    return q
+
+
+def monitor_unsubscribe(q: asyncio.Queue):
+    _monitor_queues.discard(q)
+    logger.info("Monitor client unsubscribed (%d remaining)", len(_monitor_queues))
+
+
+def emit_monitor_event(event: dict):
+    event.setdefault("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    dead = []
+    for q in _monitor_queues:
+        try:
+            q.put_nowait(event)
+        except Exception:
+            dead.append(q)
+    for q in dead:
+        _monitor_queues.discard(q)
 
 
 @mcp.tool()
@@ -201,6 +259,9 @@ async def notify_agent(agent_id: str, task_id: str) -> str:
         )
 
     queues = _agent_queues.get(agent_id, set())
+    online = bool(queues)
+    emit_monitor_event({"type": "notify", "agent": agent_id, "task": task_id, "online": online})
+
     if not queues:
         return (
             f"Agent '{agent_id}' is not connected. "

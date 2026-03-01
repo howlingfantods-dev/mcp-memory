@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Real-time monitor for MCP server activity.
+
+Connects to the /monitor SSE endpoint and prints a formatted, color-coded
+stream of all server events (tool calls, task state changes, agent
+connections, notifications).
+
+Usage:
+    python3 monitor.py
+    python3 monitor.py --no-color
+    python3 monitor.py --filter type=task
+    python3 monitor.py --filter agent=thinkpad
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+import httpx
+
+from mcp_client import MCPClient
+
+MCP_URL = os.environ.get("MCP_URL", "https://mcp.howling.one")
+
+# ANSI color codes
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+EVENT_COLORS = {
+    "connect": GREEN,
+    "disconnect": RED,
+    "task": YELLOW,
+    "tool": CYAN,
+    "notify": DIM,
+}
+
+
+def format_bytes(n: int) -> str:
+    if n >= 1024:
+        return f"{n / 1024:.1f}kB"
+    return f"{n}B"
+
+
+def format_tokens(tok_in, tok_out) -> str:
+    def _fmt(n):
+        if n >= 1000:
+            return f"{n / 1000:.1f}k"
+        return str(n)
+    return f"{_fmt(tok_in)}/{_fmt(tok_out)} tok"
+
+
+def format_event(event: dict, use_color: bool) -> str:
+    etype = event.get("type", "unknown")
+    ts = event.get("ts", "")
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+            ts = dt.strftime("%H:%M:%S")
+        except Exception:
+            ts = ts[-8:]  # fallback: last 8 chars
+    else:
+        ts = datetime.now().strftime("%H:%M:%S")
+
+    color = EVENT_COLORS.get(etype, "") if use_color else ""
+    reset = RESET if use_color else ""
+
+    label = etype.upper().ljust(10)
+
+    if etype in ("connect", "disconnect"):
+        detail = event.get("agent", "")
+        return f"{ts} {color}{label}{reset} {detail}"
+
+    if etype == "tool":
+        tool = event.get("tool", "").replace("_memory", "")
+        f = event.get("file", "")
+        b = event.get("bytes")
+        parts = [f"{ts} {color}{label}{reset} {tool.ljust(14)} {f}"]
+        if b is not None:
+            parts.append(format_bytes(b))
+        return "  ".join(parts)
+
+    if etype == "notify":
+        agent = event.get("agent", "")
+        task = event.get("task", "")
+        online = "online" if event.get("online") else "offline"
+        return f"{ts} {color}{label}{reset} {agent.ljust(14)} {task}  {online}"
+
+    if etype == "task":
+        task = event.get("task", "")
+        status = event.get("status", "")
+        agent = event.get("agent", "")
+        parts = [f"{ts} {color}{label}{reset} {task.ljust(28)} {status.ljust(12)} {agent}"]
+        if event.get("tokens_in") is not None:
+            parts.append(format_tokens(event["tokens_in"], event["tokens_out"]))
+        if event.get("cost_usd") is not None:
+            parts.append(f"${event['cost_usd']:.4f}")
+        if event.get("duration_ms") is not None:
+            parts.append(f"{event['duration_ms'] / 1000:.1f}s")
+        return "  ".join(parts)
+
+    return f"{ts} {color}{label}{reset} {json.dumps(event)}"
+
+
+def matches_filter(event: dict, filters: dict) -> bool:
+    for key, val in filters.items():
+        if str(event.get(key, "")) != val:
+            return False
+    return True
+
+
+def parse_filters(filter_args: list[str] | None) -> dict:
+    if not filter_args:
+        return {}
+    result = {}
+    for f in filter_args:
+        if "=" in f:
+            k, v = f.split("=", 1)
+            result[k] = v
+    return result
+
+
+def stream_monitor(url: str, use_color: bool, filters: dict):
+    # Use MCPClient just for OAuth token
+    client = MCPClient(url, token_name="monitor")
+    client._ensure_auth()
+    token = client._access_token
+
+    monitor_url = f"{url}/monitor"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    print(f"Connecting to {monitor_url}...")
+    with httpx.Client(timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10)) as http:
+        while True:
+            try:
+                with http.stream("GET", monitor_url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    if use_color:
+                        print(f"{GREEN}Connected{RESET}\n")
+                    else:
+                        print("Connected\n")
+                    buffer = ""
+                    for chunk in resp.iter_text():
+                        buffer += chunk
+                        while "\n\n" in buffer:
+                            block, buffer = buffer.split("\n\n", 1)
+                            block = block.strip()
+                            if not block or block.startswith(":"):
+                                continue
+                            # Parse SSE event
+                            data_line = None
+                            for line in block.splitlines():
+                                if line.startswith("data: "):
+                                    data_line = line[6:]
+                            if not data_line:
+                                continue
+                            try:
+                                event = json.loads(data_line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not matches_filter(event, filters):
+                                continue
+                            print(format_event(event, use_color))
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401:
+                    client._access_token = None
+                    client._ensure_auth()
+                    token = client._access_token
+                    headers = {"Authorization": f"Bearer {token}"}
+                    continue
+                print(f"HTTP error: {e}", file=sys.stderr)
+            except (httpx.RemoteProtocolError, httpx.ReadTimeout):
+                pass
+            except KeyboardInterrupt:
+                print("\nDisconnected.")
+                return
+
+            import time
+            time.sleep(2)
+            if use_color:
+                print(f"\n{DIM}Reconnecting...{RESET}")
+            else:
+                print("\nReconnecting...")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MCP server activity monitor")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--filter", action="append", dest="filters",
+                        metavar="KEY=VAL", help="Filter events (e.g. type=task, agent=thinkpad)")
+    args = parser.parse_args()
+
+    use_color = not args.no_color and sys.stdout.isatty()
+    filters = parse_filters(args.filters)
+    stream_monitor(MCP_URL, use_color, filters)
+
+
+if __name__ == "__main__":
+    main()

@@ -3,7 +3,10 @@ import json
 import logging
 
 from mcp_memory.config import PORT
-from mcp_memory.server import mcp, agent_subscribe, agent_unsubscribe
+from mcp_memory.server import (
+    mcp, agent_subscribe, agent_unsubscribe,
+    monitor_subscribe, monitor_unsubscribe,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-memory")
@@ -180,13 +183,81 @@ async def handle_sse(scope, receive, send):
         agent_unsubscribe(agent_id, q)
 
 
+# ── Monitor SSE endpoint ──────────────────────────────────────────────
+
+async def handle_monitor_sse(scope, receive, send):
+    """SSE endpoint: /monitor — broadcasts all server activity."""
+    q = monitor_subscribe()
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", b"text/event-stream"),
+            (b"cache-control", b"no-cache"),
+            (b"x-accel-buffering", b"no"),
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b": connected to monitor\n\n",
+        "more_body": True,
+    })
+
+    async def wait_disconnect():
+        while True:
+            msg = await receive()
+            if msg.get("type") == "http.disconnect":
+                return
+
+    disconnect_task = asyncio.create_task(wait_disconnect())
+
+    try:
+        while True:
+            queue_task = asyncio.create_task(q.get())
+            done, pending = await asyncio.wait(
+                {disconnect_task, queue_task},
+                timeout=SSE_KEEPALIVE_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if disconnect_task in done:
+                queue_task.cancel()
+                return
+
+            if queue_task in done:
+                event = queue_task.result()
+                event_type = event.get("type", "unknown")
+                data = json.dumps(event)
+                await send({
+                    "type": "http.response.body",
+                    "body": f"event: {event_type}\ndata: {data}\n\n".encode(),
+                    "more_body": True,
+                })
+            else:
+                queue_task.cancel()
+                await send({
+                    "type": "http.response.body",
+                    "body": b": keepalive\n\n",
+                    "more_body": True,
+                })
+    finally:
+        disconnect_task.cancel()
+        monitor_unsubscribe(q)
+
+
 # ── ASGI app ─────────────────────────────────────────────────────────
 
 async def app(scope, receive, send):
-    """Root ASGI app. Routes SSE before MCP middleware."""
-    if scope["type"] == "http" and scope.get("path", "").startswith("/events/"):
-        await handle_sse(scope, receive, send)
-        return
+    """Root ASGI app. Routes SSE and monitor before MCP middleware."""
+    if scope["type"] == "http":
+        path = scope.get("path", "")
+        if path.startswith("/events/"):
+            await handle_sse(scope, receive, send)
+            return
+        if path.rstrip("/") == "/monitor":
+            await handle_monitor_sse(scope, receive, send)
+            return
     await patch_metadata_middleware(scope, receive, send)
 
 

@@ -384,14 +384,16 @@ def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
 
 
 def _invoke_claude(request: str, system_prompt: str, timeout: int,
-                   allowed_tools: str = "Bash(.*)") -> tuple[str, bool]:
-    """Run claude --print and return (output, success)."""
+                   allowed_tools: str = "Bash(.*)") -> dict:
+    """Run claude --print and return dict with result, usage, cost, duration."""
     cmd = [
         "claude", "--print",
+        "--output-format", "json",
         "--dangerously-skip-permissions",
         "--allowedTools", allowed_tools,
         "--append-system-prompt", system_prompt,
     ]
+    t0 = time.monotonic()
     result = subprocess.run(
         cmd,
         input=request,
@@ -400,10 +402,30 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
         timeout=timeout,
         cwd=REPO_DIR,
     )
-    output = result.stdout.strip()
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    info = {
+        "result": "",
+        "success": result.returncode == 0,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0, "duration_ms": duration_ms},
+    }
+
+    stdout = result.stdout.strip()
+    try:
+        data = json.loads(stdout)
+        info["result"] = data.get("result", stdout)
+        if "usage" in data:
+            info["usage"]["input_tokens"] = data["usage"].get("input_tokens", 0)
+            info["usage"]["output_tokens"] = data["usage"].get("output_tokens", 0)
+        if "cost_usd" in data:
+            info["usage"]["cost_usd"] = data["cost_usd"]
+    except (json.JSONDecodeError, TypeError):
+        info["result"] = stdout
+
     if result.returncode != 0 and result.stderr:
-        output += f"\n\nSTDERR:\n{result.stderr.strip()}"
-    return output, result.returncode == 0
+        info["result"] += f"\n\nSTDERR:\n{result.stderr.strip()}"
+
+    return info
 
 
 def _execute_query(mcp: MCPClient, task_id: str, task: dict, request: str,
@@ -413,10 +435,11 @@ def _execute_query(mcp: MCPClient, task_id: str, task: dict, request: str,
 
     logger.info("Invoking claude --print for query task %s", task_id)
     try:
-        output, success = _invoke_claude(request, system_prompt, timeout)
+        info = _invoke_claude(request, system_prompt, timeout)
 
-        task["result"] = output or "(no output)"
+        task["result"] = info["result"] or "(no output)"
         task["status"] = "completed"
+        task["usage"] = info["usage"]
         append_task_log(task, AGENT_ID, "Task completed")
         write_task(mcp, task_id, task)
         logger.info("Task %s completed", task_id)
@@ -465,7 +488,7 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, task: dict, request: str,
 
         logger.info("Invoking claude --print for code-edit task %s", task_id)
         try:
-            output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools)
+            info = _invoke_claude(request, system_prompt, timeout, allowed_tools)
         except subprocess.TimeoutExpired:
             task["status"] = "failed"
             task["result"] = f"(timed out after {timeout}s)"
@@ -479,8 +502,10 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, task: dict, request: str,
         logger.info("Git: %s", git_result)
 
         # 5. Write result
+        output = info["result"]
         task["result"] = (output or "(no output)") + f"\n\nGit: {git_result}"
         task["status"] = "completed"
+        task["usage"] = info["usage"]
         append_task_log(task, AGENT_ID, f"Task completed. {git_result}")
         write_task(mcp, task_id, task)
         logger.info("Code-edit task %s completed", task_id)
