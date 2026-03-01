@@ -19,6 +19,8 @@ Environment variables:
     BLOCKED_PATHS      - Comma-separated paths to block (default: "/etc,/boot,~/.ssh")
 """
 
+VERSION = "0.2.0"
+
 import json
 import logging
 import os
