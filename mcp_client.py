@@ -196,9 +196,9 @@ class MCPClient:
             },
         )
 
-        if resp.status_code == 401:
-            # Token stale (e.g. server restarted), re-auth and retry
-            logger.info("Session init got 401, re-authenticating")
+        if resp.status_code in (401, 404):
+            # Token/session stale (e.g. server restarted), re-auth and retry
+            logger.info("Session init got %d, re-authenticating", resp.status_code)
             self._access_token = None
             self._refresh_token = None
             self._ensure_auth()
@@ -279,8 +279,8 @@ class MCPClient:
             headers=self._headers(),
         )
 
-        if resp.status_code == 401:
-            # Token expired, re-auth and retry
+        if resp.status_code in (401, 404):
+            # Token/session expired (404 = server lost session), re-auth and retry
             self._access_token = None
             self._session_id = None
             self._ensure_auth()
