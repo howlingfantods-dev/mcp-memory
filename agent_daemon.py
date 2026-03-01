@@ -468,11 +468,18 @@ def execute_task(mcp: MCPClient, task_id: str):
     timeout = int(parse_task_field(content, "timeout") or MAX_TASK_DURATION)
     task_type = parse_task_field(content, "type") or "query"
     files = parse_files_list(content)
+    depth = int(parse_task_field(content, "depth") or "0")
+
+    MAX_DEPTH = 5
+    if depth >= MAX_DEPTH:
+        _fail_task(mcp, task_id, f"Max dispatch depth ({MAX_DEPTH}) exceeded. Refusing to sub-dispatch further.")
+        _notify_creator(mcp, task_id, content)
+        return
 
     if task_type == "code-edit":
-        _execute_code_edit(mcp, task_id, request, files, allowed_commands, timeout, content)
+        _execute_code_edit(mcp, task_id, request, files, allowed_commands, timeout, content, depth)
     else:
-        _execute_query(mcp, task_id, request, allowed_commands, timeout, content)
+        _execute_query(mcp, task_id, request, allowed_commands, timeout, content, depth)
 
 
 def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
@@ -480,6 +487,8 @@ def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
     constraints = [
         f"You are executing a task on machine '{AGENT_ID}' ({AGENT_PLATFORM}).",
     ]
+    # depth is passed via closure from execute_task
+
     if request_type == "code-edit":
         constraints.append("Edit the requested files. Do NOT commit — the daemon handles git.")
     else:
@@ -519,9 +528,12 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
 
 
 def _execute_query(mcp: MCPClient, task_id: str, request: str,
-                   allowed_commands: list[str], timeout: int, content: str):
+                   allowed_commands: list[str], timeout: int, content: str,
+                   depth: int = 0):
     """Execute a query task (check something, report output)."""
     system_prompt = _build_system_prompt("query", allowed_commands)
+    if depth > 0:
+        system_prompt += f"\nThis task is at dispatch depth {depth}/{5}. If you sub-dispatch, set depth to {depth + 1}."
 
     logger.info("Invoking claude --print for query task %s", task_id)
     try:
@@ -546,7 +558,7 @@ def _execute_query(mcp: MCPClient, task_id: str, request: str,
 
 def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
                        files: list[str], allowed_commands: list[str],
-                       timeout: int, content: str):
+                       timeout: int, content: str, depth: int = 0):
     """Execute a code-edit task: lock → edit → git commit → unlock."""
     if not files:
         _fail_task(mcp, task_id, "code-edit task requires '- files:' field listing files to edit")
