@@ -325,7 +325,7 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
                     if status in ("completed", "failed"):
                         action = "response"
                     break
-            # Extract error from Result section on failure
+            # Extract errors from Result section on failure
             if status == "failed":
                 in_result = False
                 result_lines = []
@@ -337,11 +337,13 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
                         if rline.startswith("## ") or rline.startswith("# "):
                             break
                         result_lines.append(rline)
-                error_text = " ".join(result_lines).strip()
-                if error_text.startswith("_(") and error_text.endswith(")_"):
-                    error_text = error_text[2:-2]
-                if len(error_text) > 200:
-                    error_text = error_text[:197] + "..."
+                raw = " ".join(result_lines).strip()
+                if raw.startswith("_(") and raw.endswith(")_"):
+                    raw = raw[2:-2]
+                if raw:
+                    errors = [e.strip() for e in raw.split(";") if e.strip()]
+                else:
+                    errors = []
 
             for line in content.splitlines():
                 header = line.strip().lower()
@@ -370,8 +372,8 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     }
     if query:
         evt["query"] = query
-    if status == "failed" and "error_text" in dir() and error_text:
-        evt["error"] = error_text
+    if action == "response":
+        evt["errors"] = errors if "errors" in dir() else []
     evt.update(cf)
     emit_monitor_event(evt)
 

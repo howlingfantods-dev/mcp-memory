@@ -122,9 +122,9 @@ def format_event(event: dict, use_color: bool) -> str:
         if query:
             q = query if len(query) <= 80 else query[:77] + "..."
             parts.append(f"\"{q}\"")
-        error = event.get("error", "")
-        if error:
-            e = error if len(error) <= 80 else error[:77] + "..."
+        errors = event.get("errors", [])
+        for err in errors:
+            e = err if len(err) <= 80 else err[:77] + "..."
             if use_color:
                 parts.append(f"{RED}error: {e}{RESET}")
             else:
