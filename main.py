@@ -109,6 +109,7 @@ def _patch_metadata(path: str, data: dict) -> dict:
 # ── SSE endpoint for agent task notifications ───────────────────────
 
 SSE_KEEPALIVE_SECONDS = 30
+HEARTBEAT_STALE_SECONDS = 600  # 2x default heartbeat interval (300s)
 
 
 async def handle_sse(scope, receive, send):
@@ -318,12 +319,11 @@ def _build_health_page() -> str:
     cards = []
     for name in sorted(seen.keys()):
         entry = seen[name]
-        online = name in connected_agents
-        status = "online" if online else "offline"
-        status_class = status
+        has_sse = name in connected_agents
 
         # Get last_seen from agent registration
         last_seen = ""
+        heartbeat_ago = None
         reg_path = DATA_DIR / f"agent-reg-{name}.md"
         if reg_path.exists():
             try:
@@ -332,18 +332,23 @@ def _build_health_page() -> str:
                         ts = line.split("- last_seen:")[1].strip()
                         try:
                             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                            ago = (now - dt).total_seconds()
-                            if ago < 60:
-                                last_seen = f"{int(ago)}s ago"
-                            elif ago < 3600:
-                                last_seen = f"{int(ago/60)}m ago"
+                            heartbeat_ago = (now - dt).total_seconds()
+                            if heartbeat_ago < 60:
+                                last_seen = f"{int(heartbeat_ago)}s ago"
+                            elif heartbeat_ago < 3600:
+                                last_seen = f"{int(heartbeat_ago/60)}m ago"
                             else:
-                                last_seen = f"{int(ago/3600)}h ago"
+                                last_seen = f"{int(heartbeat_ago/3600)}h ago"
                         except Exception:
                             last_seen = ts
                         break
             except Exception:
                 pass
+
+        # SSE connection can linger after sleep — verify with heartbeat
+        online = has_sse and (heartbeat_ago is None or heartbeat_ago < HEARTBEAT_STALE_SECONDS)
+        status = "online" if online else "offline"
+        status_class = status
 
         details = []
         aliases = entry.get("aliases", "")
