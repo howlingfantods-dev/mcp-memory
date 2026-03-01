@@ -17,7 +17,7 @@ This repo runs agent daemons on multiple machines, coordinated through the MCP m
 Each node should know who it is. To identify yourself:
 - Read `devices.json` via `read_memory("devices.json")` — it maps OAuth client_ids to device names, specs, and aliases.
 - Your hostname or platform can also be matched against the Machines table above.
-- Always refer to other nodes by their `@alias` (e.g. `@power`, `@wsl`, `@arch`).
+- **Always** refer to other nodes by their `@alias` (e.g. `@power`, `@wsl`, `@arch`) — never use bare names like "Power" or "the WSL machine". This keeps it unambiguous and consistent with the dispatch convention.
 - Use your own alias when setting `created_by` in task files.
 
 ## Inter-Node Communication
