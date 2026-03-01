@@ -337,11 +337,14 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
 
 
 @mcp.tool()
-def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gpu: str = "", ctx: Context = None) -> str:
+def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gpu: str = "",
+                    os: str = "", env: str = "", aliases: str = "", ctx: Context = None) -> str:
     """Register the calling client's device info for monitor display.
 
     Maps the caller's OAuth client_id to a human-readable device name with specs.
-    Call this once per device to populate the lookup table.
+    Called automatically by the agent daemon at startup. Fields that are empty
+    are preserved from the existing entry (so daemon auto-registration doesn't
+    overwrite manually-set specs).
 
     Args:
         name: Short device name (e.g. "thinkpad", "power")
@@ -349,22 +352,24 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
         cpu: CPU model
         ram: RAM spec
         gpu: GPU model
+        os: Operating system (e.g. "Arch Linux", "Windows 11", "macOS Sequoia")
+        env: Runtime environment (e.g. "bare metal", "WSL2", "VM")
+        aliases: Comma-separated aliases (e.g. "@arch, @thinkpad")
     """
     cid = _get_client_id(ctx)
     if not cid:
         return "Cannot register: no client_id available in this session."
 
     devices = _load_devices()
-    entry = {"name": name}
-    if model:
-        entry["model"] = model
-    if cpu:
-        entry["cpu"] = cpu
-    if ram:
-        entry["ram"] = ram
-    if gpu:
-        entry["gpu"] = gpu
-    devices[cid] = entry
+    existing = devices.get(cid, {})
+    incoming = {"name": name}
+    for key, val in [("model", model), ("cpu", cpu), ("ram", ram), ("gpu", gpu),
+                     ("os", os), ("env", env), ("aliases", aliases)]:
+        if val:
+            incoming[key] = val
+    # Merge: incoming overwrites, but empty incoming fields keep existing values
+    merged = {**existing, **incoming}
+    devices[cid] = merged
     _save_devices(devices)
 
     emit_monitor_event({"type": "tool", "tool": "register_device", "device": name, "client": cid})
