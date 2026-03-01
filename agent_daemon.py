@@ -147,11 +147,23 @@ def update_heartbeat(mcp: MCPClient):
 # ── Task Handling ────────────────────────────────────────────────────
 
 def parse_task_field(content: str, field: str) -> str:
-    """Extract a field value from task markdown."""
-    for line in content.splitlines():
+    """Extract a field value from task markdown.
+
+    Supports two formats:
+      1. Meta-section style:  '- field: value'
+      2. Header style:        '## field\\nvalue'
+    """
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
         stripped = line.strip()
+        # Format 1: '- field: value'
         if stripped.startswith(f"- {field}:"):
             return stripped[len(f"- {field}:"):].strip()
+        # Format 2: '## field' followed by value on next line
+        if stripped.lower() == f"## {field}" and i + 1 < len(lines):
+            val = lines[i + 1].strip()
+            if val and not val.startswith("#"):
+                return val
     return ""
 
 
@@ -173,15 +185,16 @@ def parse_allowed_commands(content: str) -> list[str]:
 
 
 def parse_request(content: str) -> str:
-    """Extract the request text from the ## Request section."""
+    """Extract the request text from ## Request or ## prompt section."""
     lines = []
     in_section = False
     for line in content.splitlines():
-        if line.strip() == "## Request":
+        header = line.strip().lower()
+        if header in ("## request", "## prompt"):
             in_section = True
             continue
         if in_section:
-            if line.startswith("## "):
+            if line.startswith("## ") or line.startswith("# "):
                 break
             lines.append(line)
     return "\n".join(lines).strip()
@@ -330,16 +343,70 @@ def git_commit_files(files: list[str], message: str) -> str:
         return f"git error: {e}"
 
 
+def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str):
+    """Update task status, handling both meta-section and header formats."""
+    content = mcp.read(task_id)
+    if f"- status: {old_status}" in content:
+        mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
+    elif f"## status\n{old_status}" in content:
+        mcp.edit(task_id, f"## status\n{old_status}", f"## status\n{new_status}")
+    else:
+        # Fallback: just try meta format
+        mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
+
+
+def _edit_result(mcp: MCPClient, task_id: str, result_text: str):
+    """Write result text, handling both formats."""
+    content = mcp.read(task_id)
+    if "_(pending)_" in content:
+        mcp.edit(task_id, "_(pending)_", result_text)
+    elif "## Result\n" in content:
+        # Result section exists but has different placeholder or content — replace after header
+        old_section = content.split("## Result\n", 1)[1].split("\n## ", 1)[0]
+        mcp.edit(task_id, f"## Result\n{old_section}", f"## Result\n{result_text}\n")
+    elif "## result\n" in content:
+        old_section = content.split("## result\n", 1)[1].split("\n## ", 1)[0]
+        mcp.edit(task_id, f"## result\n{old_section}", f"## result\n{result_text}\n")
+    else:
+        # No result section — insert one before status
+        if "## status" in content:
+            mcp.edit(task_id, "## status", f"## result\n{result_text}\n\n## status")
+        elif "## Meta" in content:
+            mcp.edit(task_id, "## Log", f"## Result\n{result_text}\n\n## Log")
+        else:
+            # Last resort: append
+            mcp.write(task_id, content + f"\n\n## Result\n{result_text}\n")
+
+
 def append_log(mcp: MCPClient, task_id: str, agent: str, message: str):
     """Append a log entry to the task file."""
     log_entry = f"\n- {now_iso()} [{agent}] {message}"
-    mcp.edit(task_id, "## Log", f"## Log{log_entry}")
+    content = mcp.read(task_id)
+    if "## Log" in content:
+        mcp.edit(task_id, "## Log", f"## Log{log_entry}")
+    else:
+        # No log section — append one
+        mcp.write(task_id, content + f"\n\n## Log{log_entry}")
 
 
 def claim_task(mcp: MCPClient, task_id: str) -> bool:
     """Attempt to claim a task via optimistic locking."""
     try:
-        mcp.edit(task_id, "- status: pending", "- status: claimed")
+        content = mcp.read(task_id)
+    except Exception as e:
+        logger.info("Could not read task %s: %s", task_id, e)
+        return False
+    try:
+        # Try meta-section format first, then header format
+        if "- status: pending" in content:
+            mcp.edit(task_id, "- status: pending", "- status: claimed")
+        elif "\n## status\npending" in content:
+            mcp.edit(task_id, "## status\npending", "## status\nclaimed")
+        elif "\n## status\n pending" in content:
+            mcp.edit(task_id, "## status\n pending", "## status\nclaimed")
+        else:
+            logger.info("Could not find pending status in task %s", task_id)
+            return False
         append_log(mcp, task_id, AGENT_ID, "Claimed task")
         return True
     except Exception as e:
@@ -358,8 +425,8 @@ def execute_task(mcp: MCPClient, task_id: str):
         logger.error("Failed to read task %s: %s", task_id, e)
         return
 
-    # Verify it's for us
-    target = parse_task_field(content, "target")
+    # Verify it's for us (handle both 'target' and 'assigned_to')
+    target = parse_task_field(content, "target") or parse_task_field(content, "assigned_to")
     if target and target != AGENT_ID:
         logger.info("Task %s is for '%s', not us ('%s'). Skipping.", task_id, target, AGENT_ID)
         return
@@ -376,7 +443,7 @@ def execute_task(mcp: MCPClient, task_id: str):
 
     # Set running
     try:
-        mcp.edit(task_id, "- status: claimed", "- status: running")
+        _edit_status(mcp, task_id, "claimed", "running")
         append_log(mcp, task_id, AGENT_ID, "Executing task")
     except Exception as e:
         logger.error("Failed to set running status: %s", e)
@@ -420,12 +487,13 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
     """Run claude --print and return (output, success)."""
     cmd = [
         "claude", "--print",
+        "--dangerously-skip-permissions",
         "--allowedTools", allowed_tools,
         "--append-system-prompt", system_prompt,
-        request,
     ]
     result = subprocess.run(
         cmd,
+        input=request,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -446,14 +514,14 @@ def _execute_query(mcp: MCPClient, task_id: str, request: str,
     try:
         output, success = _invoke_claude(request, system_prompt, timeout)
 
-        mcp.edit(task_id, "_(pending)_", output or "_(no output)_")
-        mcp.edit(task_id, "- status: running", "- status: completed")
+        _edit_result(mcp, task_id, output or "_(no output)_")
+        _edit_status(mcp, task_id, "running", "completed")
         append_log(mcp, task_id, AGENT_ID, "Task completed")
         logger.info("Task %s completed", task_id)
 
     except subprocess.TimeoutExpired:
-        mcp.edit(task_id, "- status: running", "- status: failed")
-        mcp.edit(task_id, "_(pending)_", f"_(timed out after {timeout}s)_")
+        _edit_status(mcp, task_id, "running", "failed")
+        _edit_result(mcp, task_id, f"_(timed out after {timeout}s)_")
         append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
         logger.warning("Task %s timed out", task_id)
 
@@ -495,8 +563,8 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
         try:
             output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools)
         except subprocess.TimeoutExpired:
-            mcp.edit(task_id, "- status: running", "- status: failed")
-            mcp.edit(task_id, "_(pending)_", f"_(timed out after {timeout}s)_")
+            _edit_status(mcp, task_id, "running", "failed")
+            _edit_result(mcp, task_id, f"_(timed out after {timeout}s)_")
             append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
             return
 
@@ -508,8 +576,8 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
         # 5. Write result
         result_text = output or "_(no output)_"
         result_text += f"\n\n**Git:** {git_result}"
-        mcp.edit(task_id, "_(pending)_", result_text)
-        mcp.edit(task_id, "- status: running", "- status: completed")
+        _edit_result(mcp, task_id, result_text)
+        _edit_status(mcp, task_id, "running", "completed")
         append_log(mcp, task_id, AGENT_ID, f"Task completed. {git_result}")
         logger.info("Code-edit task %s completed", task_id)
 
@@ -526,8 +594,8 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
 def _fail_task(mcp: MCPClient, task_id: str, error: str):
     """Mark a task as failed."""
     try:
-        mcp.edit(task_id, "- status: running", "- status: failed")
-        mcp.edit(task_id, "_(pending)_", f"_(error: {error})_")
+        _edit_status(mcp, task_id, "running", "failed")
+        _edit_result(mcp, task_id, f"_(error: {error})_")
         append_log(mcp, task_id, AGENT_ID, f"Task failed: {error}")
     except Exception:
         pass

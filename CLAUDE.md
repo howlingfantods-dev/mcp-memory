@@ -7,9 +7,10 @@ This repo runs agent daemons on multiple machines, coordinated through the MCP m
 | Alias | Agent ID | Platform | Notes |
 |-------|----------|----------|-------|
 | @thinkpad | thinkpad | Arch Linux | X1 Carbon, primary dev laptop |
-| @legion | legion | Windows 11 | Desktop, RTX GPU, streaming/encoding |
-| @wsl | wsl | WSL2 (Ubuntu) | Linux environment on the Windows desktop |
+| @power | power | Windows 11 | Legion desktop, RTX GPU, PowerShell |
+| @wsl | wsl | WSL2 (Ubuntu) | Legion desktop, Linux environment |
 | @mac | mac | macOS | MacBook |
+| @vps | vps | Ubuntu 24.04 | Hetzner VPS, runs MCP server |
 
 ## @ Dispatch Convention
 
@@ -100,7 +101,7 @@ The `files` field is required for code-edit tasks. The daemon will:
 - `systemctl status {service}`, `journalctl -u {service} -n 50`
 - `cat {path}`, `ls -la {path}`, `find {path} -name {pattern}`
 
-**Windows (legion):**
+**Windows (power):**
 - `nvidia-smi`
 - `tasklist /FI "IMAGENAME eq {name}"`
 - `Get-Process`, `Get-Service`

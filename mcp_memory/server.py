@@ -12,11 +12,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from mcp_memory.config import DATA_DIR
-from mcp_memory.oauth_provider import MemoryOAuthProvider
+from mcp_memory.oauth_provider import PersistentOAuthProvider
 
 mcp = FastMCP(
     "memory",
-    auth_server_provider=MemoryOAuthProvider(),
+    auth_server_provider=PersistentOAuthProvider(),
     auth=AuthSettings(
         issuer_url="https://mcp.howling.one",
         resource_server_url="https://mcp.howling.one/mcp",
