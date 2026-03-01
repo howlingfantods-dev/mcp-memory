@@ -8,9 +8,6 @@ Type=simple
 # Set AGENT_ID to this machine's identifier
 Environment=AGENT_ID=thinkpad
 Environment=MCP_URL=https://mcp.howling.one
-Environment=DAEMON_PORT=9100
-# Optional: set WEBHOOK_HOST to Tailscale IP if auto-detection fails
-# Environment=WEBHOOK_HOST=100.x.x.x
 ExecStart=/usr/bin/python3 /opt/agent-daemon/agent_daemon.py
 WorkingDirectory=/opt/agent-daemon
 Restart=always

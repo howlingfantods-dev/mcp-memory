@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Agent daemon — lightweight HTTP server that executes tasks on demand.
+"""Agent daemon — connects to MCP server via SSE, executes tasks on demand.
 
-Receives webhook notifications from the MCP server, reads/claims tasks,
-invokes `claude --print` for execution, and writes results back.
-Zero idle cost: no polling, no LLM tokens burned on coordination.
+Opens an outbound SSE connection to the MCP server. When a task notification
+arrives, reads/claims the task, invokes `claude --print` for execution, and
+writes results back. Zero idle cost: no polling, no open ports, no LLM tokens
+burned on coordination.
 
 Usage:
     AGENT_ID=thinkpad MCP_URL=https://mcp.howling.one python3 agent_daemon.py
 
 Environment variables:
-    AGENT_ID        - Unique agent identifier (e.g. "thinkpad", "legion")
-    MCP_URL         - Base URL of the MCP memory server
-    DAEMON_PORT     - Webhook listener port (default: 9100)
-    PLATFORM        - Override platform detection (linux/darwin/win32)
-    AGENT_ROLES     - Comma-separated roles (default: "general")
+    AGENT_ID           - Unique agent identifier (e.g. "thinkpad", "legion")
+    MCP_URL            - Base URL of the MCP memory server
+    PLATFORM           - Override platform detection (linux/darwin/win32)
+    AGENT_ROLES        - Comma-separated roles (default: "general")
     HEARTBEAT_INTERVAL - Seconds between heartbeats (default: 300)
     MAX_TASK_DURATION  - Max seconds for task execution (default: 300)
     BLOCKED_PATHS      - Comma-separated paths to block (default: "/etc,/boot,~/.ssh")
@@ -22,8 +22,6 @@ Environment variables:
 import json
 import logging
 import os
-import platform
-import re
 import signal
 import socket
 import subprocess
@@ -31,7 +29,8 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import httpx
 
 from mcp_client import MCPClient
 
@@ -45,7 +44,6 @@ logger = logging.getLogger("agent-daemon")
 
 AGENT_ID = os.environ.get("AGENT_ID", socket.gethostname())
 MCP_URL = os.environ.get("MCP_URL", "https://mcp.howling.one")
-DAEMON_PORT = int(os.environ.get("DAEMON_PORT", "9100"))
 AGENT_PLATFORM = os.environ.get("PLATFORM", sys.platform)
 AGENT_ROLES = os.environ.get("AGENT_ROLES", "general").split(",")
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "300"))
@@ -101,7 +99,7 @@ def detect_shell() -> str:
 
 # ── Agent Registration ───────────────────────────────────────────────
 
-def build_registration(webhook_url: str) -> str:
+def build_registration() -> str:
     return f"""# Agent: {AGENT_ID}
 
 ## Identity
@@ -109,8 +107,8 @@ def build_registration(webhook_url: str) -> str:
 - platform: {AGENT_PLATFORM}
 - registered: {now_iso()}
 
-## Endpoint
-- webhook: {webhook_url}
+## Status
+- connection: sse
 - status: online
 - last_seen: {now_iso()}
 
@@ -125,31 +123,23 @@ def build_registration(webhook_url: str) -> str:
 """
 
 
-def register_agent(mcp: MCPClient, webhook_url: str):
+def register_agent(mcp: MCPClient):
     """Write or overwrite agent registration file."""
-    content = build_registration(webhook_url)
+    content = build_registration()
     mcp.write(REG_FILENAME, content)
-    logger.info("Registered agent '%s' with webhook %s", AGENT_ID, webhook_url)
+    logger.info("Registered agent '%s'", AGENT_ID)
 
 
 def update_heartbeat(mcp: MCPClient):
     """Update last_seen timestamp — direct HTTP, no LLM."""
     try:
-        mcp.edit(
-            REG_FILENAME,
-            old_text="- last_seen: ",  # Match prefix
-            new_text=f"- last_seen: {now_iso()}",
-        )
-    except Exception:
-        # If prefix match fails (edit_memory matches full line), read and replace
-        try:
-            content = mcp.read(REG_FILENAME)
-            for line in content.splitlines():
-                if line.strip().startswith("- last_seen:"):
-                    mcp.edit(REG_FILENAME, line.strip(), f"- last_seen: {now_iso()}")
-                    break
-        except Exception as e:
-            logger.warning("Heartbeat update failed: %s", e)
+        content = mcp.read(REG_FILENAME)
+        for line in content.splitlines():
+            if line.strip().startswith("- last_seen:"):
+                mcp.edit(REG_FILENAME, line.strip(), f"- last_seen: {now_iso()}")
+                return
+    except Exception as e:
+        logger.warning("Heartbeat update failed: %s", e)
 
 
 # ── Task Handling ────────────────────────────────────────────────────
@@ -195,7 +185,7 @@ def parse_request(content: str) -> str:
     return "\n".join(lines).strip()
 
 
-def append_log(mcp: MCPClient, task_id: str, content: str, agent: str, message: str):
+def append_log(mcp: MCPClient, task_id: str, agent: str, message: str):
     """Append a log entry to the task file."""
     log_entry = f"\n- {now_iso()} [{agent}] {message}"
     mcp.edit(task_id, "## Log", f"## Log{log_entry}")
@@ -204,8 +194,8 @@ def append_log(mcp: MCPClient, task_id: str, content: str, agent: str, message: 
 def claim_task(mcp: MCPClient, task_id: str) -> bool:
     """Attempt to claim a task via optimistic locking."""
     try:
-        mcp.edit(task_id, "- status: pending", f"- status: claimed")
-        append_log(mcp, task_id, "", AGENT_ID, "Claimed task")
+        mcp.edit(task_id, "- status: pending", "- status: claimed")
+        append_log(mcp, task_id, AGENT_ID, "Claimed task")
         return True
     except Exception as e:
         logger.info("Could not claim task %s: %s", task_id, e)
@@ -242,7 +232,7 @@ def execute_task(mcp: MCPClient, task_id: str):
     # Set running
     try:
         mcp.edit(task_id, "- status: claimed", "- status: running")
-        append_log(mcp, task_id, "", AGENT_ID, "Executing task")
+        append_log(mcp, task_id, AGENT_ID, "Executing task")
     except Exception as e:
         logger.error("Failed to set running status: %s", e)
         return
@@ -272,7 +262,7 @@ def execute_task(mcp: MCPClient, task_id: str):
         cmd = [
             "claude", "--print",
             "--allowedTools", "Bash(.*)",
-            "--systemPrompt", system_prompt,
+            "--append-system-prompt", system_prompt,
             request,
         ]
         result = subprocess.run(
@@ -288,20 +278,20 @@ def execute_task(mcp: MCPClient, task_id: str):
         # Write result
         mcp.edit(task_id, "_(pending)_", output or "_(no output)_")
         mcp.edit(task_id, "- status: running", "- status: completed")
-        append_log(mcp, task_id, "", AGENT_ID, "Task completed")
+        append_log(mcp, task_id, AGENT_ID, "Task completed")
         logger.info("Task %s completed", task_id)
 
     except subprocess.TimeoutExpired:
         mcp.edit(task_id, "- status: running", "- status: failed")
         mcp.edit(task_id, "_(pending)_", f"_(timed out after {timeout}s)_")
-        append_log(mcp, task_id, "", AGENT_ID, f"Task timed out after {timeout}s")
+        append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
         logger.warning("Task %s timed out", task_id)
 
     except Exception as e:
         try:
             mcp.edit(task_id, "- status: running", "- status: failed")
             mcp.edit(task_id, "_(pending)_", f"_(error: {e})_")
-            append_log(mcp, task_id, "", AGENT_ID, f"Task failed: {e}")
+            append_log(mcp, task_id, AGENT_ID, f"Task failed: {e}")
         except Exception:
             pass
         logger.error("Task %s failed: %s", task_id, e)
@@ -313,80 +303,74 @@ def execute_task(mcp: MCPClient, task_id: str):
             mcp.notify_agent(created_by, task_id)
             logger.info("Notified '%s' about completed task %s", created_by, task_id)
         except Exception:
-            pass  # Best-effort
+            pass
 
 
-# ── Webhook HTTP Server ──────────────────────────────────────────────
+# ── SSE Client ───────────────────────────────────────────────────────
 
-class WebhookHandler(BaseHTTPRequestHandler):
-    """Handles incoming webhook notifications."""
-
-    mcp_client: MCPClient  # set on the class before serving
-
-    def do_POST(self):
-        if self.path != "/task":
-            self.send_error(404)
-            return
-
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-
+def parse_sse_event(text: str) -> str | None:
+    """Parse an SSE event block and return task_id if it's a task event."""
+    event_type = None
+    data = None
+    for line in text.strip().splitlines():
+        if line.startswith("event: "):
+            event_type = line[7:]
+        elif line.startswith("data: "):
+            data = line[6:]
+    if event_type == "task" and data:
         try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-            return
+            return json.loads(data)["task_id"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
 
-        task_id = data.get("task_id")
-        if not task_id:
-            self.send_error(400, "Missing task_id")
-            return
 
-        # Respond immediately, process async
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "accepted"}).encode())
-
-        # Execute in a thread so we don't block the server
-        thread = threading.Thread(
-            target=execute_task,
-            args=(self.__class__.mcp_client, task_id),
-            daemon=True,
-        )
-        thread.start()
-
-    def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "agent_id": AGENT_ID,
-                "status": "online",
-                "timestamp": now_iso(),
-            }).encode())
-            return
-        self.send_error(404)
-
-    def log_message(self, format, *args):
-        logger.debug("HTTP %s", format % args)
+def sse_listen(mcp: MCPClient, sse_url: str):
+    """Connect to SSE endpoint and process task notifications. Reconnects on drop."""
+    while True:
+        try:
+            logger.info("Connecting to SSE: %s", sse_url)
+            with httpx.Client(timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10)) as client:
+                with client.stream("GET", sse_url) as response:
+                    response.raise_for_status()
+                    logger.info("SSE connected")
+                    buffer = ""
+                    for chunk in response.iter_text():
+                        buffer += chunk
+                        while "\n\n" in buffer:
+                            event_text, buffer = buffer.split("\n\n", 1)
+                            event_text = event_text.strip()
+                            if not event_text or event_text.startswith(":"):
+                                continue  # comment/keepalive
+                            task_id = parse_sse_event(event_text)
+                            if task_id:
+                                logger.info("Received task notification: %s", task_id)
+                                thread = threading.Thread(
+                                    target=execute_task,
+                                    args=(mcp, task_id),
+                                    daemon=True,
+                                )
+                                thread.start()
+        except Exception as e:
+            logger.warning("SSE connection lost: %s. Reconnecting in 5s...", e)
+            time.sleep(5)
 
 
 # ── Heartbeat ────────────────────────────────────────────────────────
 
 def heartbeat_loop(mcp: MCPClient, interval: int):
-    """Background thread that updates last_seen periodically."""
+    """Background thread that updates last_seen and cleans up old tasks."""
     while True:
         time.sleep(interval)
         update_heartbeat(mcp)
+        cleanup_old_tasks(mcp)
         logger.debug("Heartbeat sent")
 
 
 # ── Cleanup old tasks ────────────────────────────────────────────────
 
 def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
-    """Delete completed/failed tasks older than max_age_hours. Called during heartbeat."""
+    """Delete completed/failed tasks older than max_age_hours."""
     try:
         file_list = mcp.list(prefix="task-")
         if file_list == "No memory files found.":
@@ -400,7 +384,6 @@ def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
                 status = parse_task_field(content, "status")
                 if status not in ("completed", "failed"):
                     continue
-                # Check age from created timestamp
                 created = parse_task_field(content, "created")
                 if not created:
                     continue
@@ -415,37 +398,46 @@ def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
         logger.debug("Cleanup failed: %s", e)
 
 
+# ── Startup: check for pending tasks ─────────────────────────────────
+
+def check_pending_tasks(mcp: MCPClient):
+    """On startup, check for any pending tasks targeting this agent."""
+    try:
+        file_list = mcp.list(prefix="task-")
+        if file_list == "No memory files found.":
+            return
+        for filename in file_list.splitlines():
+            filename = filename.strip()
+            if not filename:
+                continue
+            try:
+                content = mcp.read(filename)
+                status = parse_task_field(content, "status")
+                target = parse_task_field(content, "target")
+                if status == "pending" and (not target or target == AGENT_ID):
+                    logger.info("Found pending task from before disconnect: %s", filename)
+                    thread = threading.Thread(
+                        target=execute_task,
+                        args=(mcp, filename),
+                        daemon=True,
+                    )
+                    thread.start()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("Pending task check failed: %s", e)
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
-    # Determine webhook URL
-    # In production, this should be the Tailscale IP or a configured address
-    webhook_host = os.environ.get("WEBHOOK_HOST", "")
-    if not webhook_host:
-        # Try to detect Tailscale IP
-        try:
-            result = subprocess.run(
-                ["tailscale", "ip", "-4"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                webhook_host = result.stdout.strip()
-        except Exception:
-            pass
-    if not webhook_host:
-        webhook_host = "127.0.0.1"
-        logger.warning("No Tailscale IP found, using localhost. Set WEBHOOK_HOST for remote access.")
-
-    webhook_url = f"http://{webhook_host}:{DAEMON_PORT}/task"
-
-    # Initialize MCP client
     mcp = MCPClient(MCP_URL, token_name=AGENT_ID)
 
-    # Set mcp client on handler class
-    WebhookHandler.mcp_client = mcp
-
     # Register
-    register_agent(mcp, webhook_url)
+    register_agent(mcp)
+
+    # Pick up any tasks that arrived while we were offline
+    check_pending_tasks(mcp)
 
     # Start heartbeat thread
     heartbeat_thread = threading.Thread(
@@ -455,7 +447,7 @@ def main():
     )
     heartbeat_thread.start()
 
-    # Handle shutdown gracefully
+    # Graceful shutdown
     def shutdown(signum, frame):
         logger.info("Shutting down...")
         try:
@@ -468,13 +460,10 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # Start HTTP server
-    server = HTTPServer(("0.0.0.0", DAEMON_PORT), WebhookHandler)
-    logger.info(
-        "Agent daemon '%s' listening on :%d (webhook: %s)",
-        AGENT_ID, DAEMON_PORT, webhook_url,
-    )
-    server.serve_forever()
+    # Connect to SSE and listen for tasks (blocks forever, reconnects on drop)
+    sse_url = f"{MCP_URL}/events/{AGENT_ID}"
+    logger.info("Agent daemon '%s' starting (SSE: %s)", AGENT_ID, sse_url)
+    sse_listen(mcp, sse_url)
 
 
 if __name__ == "__main__":

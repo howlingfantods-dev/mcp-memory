@@ -1,8 +1,7 @@
+import asyncio
 import logging
 import re
 from pathlib import Path
-
-import httpx
 
 from mcp.server.auth.settings import (
     AuthSettings,
@@ -153,12 +152,37 @@ def delete_memory(filename: str) -> str:
     return f"Deleted {filename}."
 
 
+# ── SSE event queues ─────────────────────────────────────────────────
+# Each connected agent holds an asyncio.Queue. notify_agent pushes to it,
+# the SSE endpoint in main.py streams from it. No outbound HTTP needed.
+
+_agent_queues: dict[str, set[asyncio.Queue]] = {}
+
+
+def agent_subscribe(agent_id: str) -> asyncio.Queue:
+    """Register an SSE listener for an agent. Called from the SSE endpoint."""
+    q: asyncio.Queue = asyncio.Queue()
+    _agent_queues.setdefault(agent_id, set()).add(q)
+    logger.info("Agent '%s' subscribed to SSE (%d listeners)", agent_id, len(_agent_queues[agent_id]))
+    return q
+
+
+def agent_unsubscribe(agent_id: str, q: asyncio.Queue):
+    """Remove an SSE listener. Called when the SSE connection drops."""
+    if agent_id in _agent_queues:
+        _agent_queues[agent_id].discard(q)
+        if not _agent_queues[agent_id]:
+            del _agent_queues[agent_id]
+    logger.info("Agent '%s' unsubscribed from SSE", agent_id)
+
+
 @mcp.tool()
 async def notify_agent(agent_id: str, task_id: str) -> str:
-    """Send a webhook notification to an agent about a new task.
+    """Send a notification to an agent about a new task.
 
-    Reads the agent's registration file to find its webhook URL,
-    then POSTs a notification with the task ID.
+    The agent must be connected via SSE to receive the notification.
+    If the agent is offline, the task file remains pending and will be
+    picked up when the agent reconnects.
 
     Args:
         agent_id: Target agent ID (e.g. "legion", "thinkpad")
@@ -172,41 +196,14 @@ async def notify_agent(agent_id: str, task_id: str) -> str:
             f"Is agent '{agent_id}' registered?"
         )
 
-    content = reg_path.read_text()
-
-    # Parse webhook URL from "- webhook: http://host:port/path" line
-    webhook_url = None
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- webhook:"):
-            webhook_url = stripped[len("- webhook:"):].strip()
-            break
-
-    if not webhook_url:
-        raise ValueError(
-            f"No webhook URL found in agent registry for '{agent_id}'."
+    queues = _agent_queues.get(agent_id, set())
+    if not queues:
+        return (
+            f"Agent '{agent_id}' is not connected. "
+            f"Task '{task_id}' is saved and will be picked up when it reconnects."
         )
 
-    # Check agent status
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- status:"):
-            status = stripped[len("- status:"):].strip()
-            if status != "online":
-                logger.warning("Agent '%s' status is '%s', sending anyway", agent_id, status)
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                webhook_url,
-                json={"task_id": task_id},
-            )
-            resp.raise_for_status()
-    except httpx.ConnectError:
-        return f"Failed to reach agent '{agent_id}' at {webhook_url} (connection refused). Is the daemon running?"
-    except httpx.TimeoutException:
-        return f"Timeout notifying agent '{agent_id}' at {webhook_url}."
-    except httpx.HTTPStatusError as e:
-        return f"Agent '{agent_id}' returned HTTP {e.response.status_code}: {e.response.text}"
+    for q in queues:
+        await q.put(task_id)
 
     return f"Notified agent '{agent_id}' about task '{task_id}'."

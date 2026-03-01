@@ -1,10 +1,12 @@
+import asyncio
 import json
 import logging
 
 from mcp_memory.config import PORT
-from mcp_memory.server import mcp
+from mcp_memory.server import mcp, agent_subscribe, agent_unsubscribe
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mcp-memory")
 
 inner_app = mcp.streamable_http_app()
 
@@ -98,7 +100,95 @@ def _patch_metadata(path: str, data: dict) -> dict:
     return data
 
 
-app = patch_metadata_middleware
+# ── SSE endpoint for agent task notifications ───────────────────────
+
+SSE_KEEPALIVE_SECONDS = 30
+
+
+async def handle_sse(scope, receive, send):
+    """SSE endpoint: /events/{agent_id}
+
+    Agents connect outbound to this endpoint. The server pushes task
+    notifications down the connection. No inbound ports needed on agents.
+    """
+    path = scope["path"].rstrip("/")
+    parts = path.split("/")
+    # Expect /events/{agent_id}
+    if len(parts) != 3 or parts[1] != "events" or not parts[2]:
+        await send({"type": "http.response.start", "status": 404, "headers": []})
+        await send({"type": "http.response.body", "body": b"Not Found"})
+        return
+
+    agent_id = parts[2]
+    q = agent_subscribe(agent_id)
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", b"text/event-stream"),
+            (b"cache-control", b"no-cache"),
+            (b"x-accel-buffering", b"no"),  # tell nginx not to buffer
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": f": connected as {agent_id}\n\n".encode(),
+        "more_body": True,
+    })
+
+    # Watch for client disconnect
+    async def wait_disconnect():
+        while True:
+            msg = await receive()
+            if msg.get("type") == "http.disconnect":
+                return
+
+    disconnect_task = asyncio.create_task(wait_disconnect())
+
+    try:
+        while True:
+            queue_task = asyncio.create_task(q.get())
+            done, pending = await asyncio.wait(
+                {disconnect_task, queue_task},
+                timeout=SSE_KEEPALIVE_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if disconnect_task in done:
+                queue_task.cancel()
+                return
+
+            if queue_task in done:
+                task_id = queue_task.result()
+                data = json.dumps({"task_id": task_id})
+                await send({
+                    "type": "http.response.body",
+                    "body": f"event: task\ndata: {data}\n\n".encode(),
+                    "more_body": True,
+                })
+            else:
+                # Timeout — send keepalive so proxies don't drop the connection
+                queue_task.cancel()
+                await send({
+                    "type": "http.response.body",
+                    "body": b": keepalive\n\n",
+                    "more_body": True,
+                })
+    finally:
+        disconnect_task.cancel()
+        agent_unsubscribe(agent_id, q)
+
+
+# ── ASGI app ─────────────────────────────────────────────────────────
+
+async def app(scope, receive, send):
+    """Root ASGI app. Routes SSE before MCP middleware."""
+    if scope["type"] == "http" and scope.get("path", "").startswith("/events/"):
+        await handle_sse(scope, receive, send)
+        return
+    await patch_metadata_middleware(scope, receive, send)
+
 
 if __name__ == "__main__":
     import uvicorn

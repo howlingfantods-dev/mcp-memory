@@ -195,6 +195,32 @@ class MCPClient:
                 "Accept": "application/json, text/event-stream",
             },
         )
+
+        if resp.status_code == 401:
+            # Token stale (e.g. server restarted), re-auth and retry
+            logger.info("Session init got 401, re-authenticating")
+            self._access_token = None
+            self._refresh_token = None
+            self._ensure_auth()
+            resp = self._client.post(
+                self.mcp_endpoint,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "mcp-agent-daemon", "version": "0.1.0"},
+                    },
+                },
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+
         resp.raise_for_status()
 
         self._session_id = resp.headers.get("mcp-session-id")
