@@ -36,14 +36,14 @@ mcp = FastMCP(
 
 logger = logging.getLogger("mcp-memory")
 
-FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.md$")
+FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.(md|json)$")
 
 
 def _validate_filename(filename: str) -> Path:
     if not FILENAME_RE.match(filename):
         raise ValueError(
             f"Invalid filename '{filename}'. "
-            "Must be alphanumeric/dashes/underscores with .md extension."
+            "Must be alphanumeric/dashes/underscores with .md or .json extension."
         )
     path = (DATA_DIR / filename).resolve()
     if not str(path).startswith(str(DATA_DIR.resolve())):
@@ -58,7 +58,9 @@ def list_memories(prefix: str = "") -> str:
     Args:
         prefix: Optional prefix to filter filenames (e.g. "task-" or "agent-reg-")
     """
-    files = sorted(p.name for p in DATA_DIR.glob("*.md"))
+    files = sorted(
+        p.name for ext in ("*.md", "*.json") for p in DATA_DIR.glob(ext)
+    )
     if prefix:
         files = [f for f in files if f.startswith(prefix)]
     if not files:
@@ -120,7 +122,9 @@ def search_memories(query: str) -> str:
         query: Text to search for (case-insensitive)
     """
     results = []
-    for path in sorted(DATA_DIR.glob("*.md")):
+    for path in sorted(
+        p for ext in ("*.md", "*.json") for p in DATA_DIR.glob(ext)
+    ):
         content = path.read_text()
         lines = content.splitlines()
         matches = [

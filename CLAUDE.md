@@ -17,8 +17,8 @@ This repo runs agent daemons on multiple machines, coordinated through the MCP m
 When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs", "@legion what's GPU usage"), dispatch a task to that machine:
 
 1. **Create the task file** with `write_memory`:
-   - Filename: `task-YYYYMMDD-HHMM-{short-desc}.md`
-   - Use the template below
+   - Filename: `task-YYYYMMDD-HHMM-{short-desc}.json`
+   - Use the JSON template below
    - Always include explicit allowed commands
 
 2. **Notify the agent** with `notify_agent("{agent_id}", "{task_filename}")`
@@ -31,58 +31,46 @@ There are two task types: **query** (default) and **code-edit**.
 
 #### Query task (check something, report output)
 
-```markdown
-# Task: {short-desc}
-
-## Meta
-- status: pending
-- type: query
-- created: {ISO 8601 UTC timestamp}
-- created_by: {this machine's agent ID, or "user" if interactive}
-- target: {target agent_id}
-- timeout: 120
-
-## Request
-{What to do — be specific and concise}
-
-## Allowed Commands
-- {explicit command 1}
-- {explicit command 2}
-
-## Result
-_(pending)_
-
-## Log
-- {timestamp} [{creator}] Created task
+```json
+{
+  "title": "{short description}",
+  "status": "pending",
+  "type": "query",
+  "created": "{ISO 8601 UTC timestamp}",
+  "created_by": "{this machine's agent ID, or 'user' if interactive}",
+  "target": "{target agent_id}",
+  "timeout": 120,
+  "request": "{what to do — be specific and concise}",
+  "allowed_commands": ["{command 1}", "{command 2}"],
+  "files": [],
+  "result": null,
+  "log": [
+    {"ts": "{timestamp}", "agent": "{creator}", "msg": "Created task"}
+  ]
+}
 ```
 
 #### Code-edit task (modify files in the synced repo)
 
 The daemon automatically handles: lock acquisition → edit → git commit → lock release.
 
-```markdown
-# Task: {short-desc}
-
-## Meta
-- status: pending
-- type: code-edit
-- created: {ISO 8601 UTC timestamp}
-- created_by: {this machine's agent ID, or "user" if interactive}
-- target: {target agent_id}
-- files: {comma-separated list of files to edit, e.g. agent_daemon.py, mcp_client.py}
-- timeout: 300
-
-## Request
-{What to change — be specific about the desired behavior}
-
-## Allowed Commands
-- {any shell commands needed, e.g. running tests}
-
-## Result
-_(pending)_
-
-## Log
-- {timestamp} [{creator}] Created task
+```json
+{
+  "title": "{short description}",
+  "status": "pending",
+  "type": "code-edit",
+  "created": "{ISO 8601 UTC timestamp}",
+  "created_by": "{this machine's agent ID, or 'user' if interactive}",
+  "target": "{target agent_id}",
+  "timeout": 300,
+  "request": "{what to change — be specific about the desired behavior}",
+  "allowed_commands": ["{any shell commands needed}"],
+  "files": ["{file1.py}", "{file2.py}"],
+  "result": null,
+  "log": [
+    {"ts": "{timestamp}", "agent": "{creator}", "msg": "Created task"}
+  ]
+}
 ```
 
 The `files` field is required for code-edit tasks. The daemon will:
