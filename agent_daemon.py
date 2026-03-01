@@ -49,6 +49,8 @@ AGENT_ROLES = os.environ.get("AGENT_ROLES", "general").split(",")
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "300"))
 MAX_TASK_DURATION = int(os.environ.get("MAX_TASK_DURATION", "300"))
 BLOCKED_PATHS = os.environ.get("BLOCKED_PATHS", "/etc,/boot,~/.ssh").split(",")
+REPO_DIR = os.environ.get("REPO_DIR", os.getcwd())
+SYNCTHING_SETTLE_SECONDS = int(os.environ.get("SYNCTHING_SETTLE", "5"))
 
 REG_FILENAME = f"agent-reg-{AGENT_ID}.md"
 
@@ -185,6 +187,129 @@ def parse_request(content: str) -> str:
     return "\n".join(lines).strip()
 
 
+def parse_files_list(content: str) -> list[str]:
+    """Extract the files list from '- files: a.py, b.py' in task meta."""
+    raw = parse_task_field(content, "files")
+    if not raw:
+        return []
+    return [f.strip() for f in raw.split(",") if f.strip()]
+
+
+def lock_filename(filepath: str) -> str:
+    """Convert a filepath to a lock filename: agent_daemon.py → lock-agent-daemon-py.md"""
+    safe = filepath.replace("/", "-").replace("\\", "-").replace(".", "-").replace("_", "-")
+    return f"lock-{safe}.md"
+
+
+# ── File Locking ─────────────────────────────────────────────────────
+
+def acquire_locks(mcp: MCPClient, files: list[str]) -> list[str]:
+    """Acquire MCP file locks for a list of files.
+
+    Returns list of files successfully locked. If any lock fails (already held
+    by another agent), releases all acquired locks and returns empty list.
+    """
+    acquired = []
+    for filepath in files:
+        lf = lock_filename(filepath)
+        try:
+            # Check if lock exists
+            existing = mcp.read(lf)
+            # Lock exists — check if stale
+            if _is_stale_lock(mcp, existing):
+                logger.info("Breaking stale lock on %s", filepath)
+                mcp.delete(lf)
+            else:
+                logger.warning("File '%s' is locked by another agent", filepath)
+                release_locks(mcp, acquired)
+                return []
+        except Exception:
+            pass  # FileNotFoundError = not locked, proceed
+
+        lock_content = (
+            f"- holder: {AGENT_ID}\n"
+            f"- acquired: {now_iso()}\n"
+            f"- file: {filepath}\n"
+        )
+        mcp.write(lf, lock_content)
+        acquired.append(filepath)
+        logger.info("Acquired lock: %s", filepath)
+
+    return acquired
+
+
+def release_locks(mcp: MCPClient, files: list[str]):
+    """Release MCP file locks."""
+    for filepath in files:
+        lf = lock_filename(filepath)
+        try:
+            mcp.delete(lf)
+            logger.info("Released lock: %s", filepath)
+        except Exception:
+            pass
+
+
+def _is_stale_lock(mcp: MCPClient, lock_content: str) -> bool:
+    """Check if a lock is stale (holder offline >10 min)."""
+    holder = None
+    for line in lock_content.splitlines():
+        if line.strip().startswith("- holder:"):
+            holder = line.strip()[len("- holder:"):].strip()
+            break
+    if not holder:
+        return True
+    try:
+        reg = mcp.read(f"agent-reg-{holder}.md")
+        for line in reg.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- status:") and "offline" in stripped:
+                return True
+            if stripped.startswith("- last_seen:"):
+                last_seen_str = stripped[len("- last_seen:"):].strip()
+                last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - last_seen).total_seconds() / 60
+                if age_min > 10:
+                    return True
+    except Exception:
+        return True  # Can't read registry = assume stale
+    return False
+
+
+def git_commit_files(files: list[str], message: str) -> str:
+    """Stage and commit specific files. Returns commit output or error."""
+    try:
+        # Stage
+        result = subprocess.run(
+            ["git", "add"] + files,
+            capture_output=True, text=True, timeout=10,
+            cwd=REPO_DIR,
+        )
+        if result.returncode != 0:
+            return f"git add failed: {result.stderr.strip()}"
+
+        # Check if there's anything to commit
+        status = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            capture_output=True, timeout=10,
+            cwd=REPO_DIR,
+        )
+        if status.returncode == 0:
+            return "No changes to commit"
+
+        # Commit
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            capture_output=True, text=True, timeout=10,
+            cwd=REPO_DIR,
+        )
+        if result.returncode != 0:
+            return f"git commit failed: {result.stderr.strip()}"
+
+        return result.stdout.strip()
+    except Exception as e:
+        return f"git error: {e}"
+
+
 def append_log(mcp: MCPClient, task_id: str, agent: str, message: str):
     """Append a log entry to the task file."""
     log_entry = f"\n- {now_iso()} [{agent}] {message}"
@@ -241,12 +366,25 @@ def execute_task(mcp: MCPClient, task_id: str):
     request = parse_request(content)
     allowed_commands = parse_allowed_commands(content)
     timeout = int(parse_task_field(content, "timeout") or MAX_TASK_DURATION)
+    task_type = parse_task_field(content, "type") or "query"
+    files = parse_files_list(content)
 
-    # Build system prompt for claude
+    if task_type == "code-edit":
+        _execute_code_edit(mcp, task_id, request, files, allowed_commands, timeout, content)
+    else:
+        _execute_query(mcp, task_id, request, allowed_commands, timeout, content)
+
+
+def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
+    """Build system prompt constraints for claude --print."""
     constraints = [
         f"You are executing a task on machine '{AGENT_ID}' ({AGENT_PLATFORM}).",
-        "Execute the requested task and provide the output.",
     ]
+    if request_type == "code-edit":
+        constraints.append("Edit the requested files. Do NOT commit — the daemon handles git.")
+    else:
+        constraints.append("Execute the requested task and provide the output.")
+
     if allowed_commands:
         cmd_list = "\n".join(f"  - {cmd}" for cmd in allowed_commands)
         constraints.append(f"You may ONLY run these commands:\n{cmd_list}")
@@ -254,28 +392,40 @@ def execute_task(mcp: MCPClient, task_id: str):
     if BLOCKED_PATHS:
         constraints.append(f"Do NOT access these paths: {', '.join(BLOCKED_PATHS)}")
 
-    system_prompt = "\n".join(constraints)
+    return "\n".join(constraints)
 
-    # Invoke claude --print
-    logger.info("Invoking claude --print for task %s", task_id)
+
+def _invoke_claude(request: str, system_prompt: str, timeout: int,
+                   allowed_tools: str = "Bash(.*)") -> tuple[str, bool]:
+    """Run claude --print and return (output, success)."""
+    cmd = [
+        "claude", "--print",
+        "--allowedTools", allowed_tools,
+        "--append-system-prompt", system_prompt,
+        request,
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=REPO_DIR,
+    )
+    output = result.stdout.strip()
+    if result.returncode != 0 and result.stderr:
+        output += f"\n\nSTDERR:\n{result.stderr.strip()}"
+    return output, result.returncode == 0
+
+
+def _execute_query(mcp: MCPClient, task_id: str, request: str,
+                   allowed_commands: list[str], timeout: int, content: str):
+    """Execute a query task (check something, report output)."""
+    system_prompt = _build_system_prompt("query", allowed_commands)
+
+    logger.info("Invoking claude --print for query task %s", task_id)
     try:
-        cmd = [
-            "claude", "--print",
-            "--allowedTools", "Bash(.*)",
-            "--append-system-prompt", system_prompt,
-            request,
-        ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0 and result.stderr:
-            output += f"\n\nSTDERR:\n{result.stderr.strip()}"
+        output, success = _invoke_claude(request, system_prompt, timeout)
 
-        # Write result
         mcp.edit(task_id, "_(pending)_", output or "_(no output)_")
         mcp.edit(task_id, "- status: running", "- status: completed")
         append_log(mcp, task_id, AGENT_ID, "Task completed")
@@ -288,15 +438,84 @@ def execute_task(mcp: MCPClient, task_id: str):
         logger.warning("Task %s timed out", task_id)
 
     except Exception as e:
-        try:
-            mcp.edit(task_id, "- status: running", "- status: failed")
-            mcp.edit(task_id, "_(pending)_", f"_(error: {e})_")
-            append_log(mcp, task_id, AGENT_ID, f"Task failed: {e}")
-        except Exception:
-            pass
-        logger.error("Task %s failed: %s", task_id, e)
+        _fail_task(mcp, task_id, str(e))
 
-    # Notify creator that task is done (best-effort)
+    _notify_creator(mcp, task_id, content)
+
+
+def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
+                       files: list[str], allowed_commands: list[str],
+                       timeout: int, content: str):
+    """Execute a code-edit task: lock → edit → git commit → unlock."""
+    if not files:
+        _fail_task(mcp, task_id, "code-edit task requires '- files:' field listing files to edit")
+        _notify_creator(mcp, task_id, content)
+        return
+
+    # 1. Acquire file locks
+    logger.info("Acquiring locks for %s", files)
+    append_log(mcp, task_id, AGENT_ID, f"Acquiring locks: {', '.join(files)}")
+    locked = acquire_locks(mcp, files)
+    if not locked:
+        _fail_task(mcp, task_id, f"Could not acquire locks for: {', '.join(files)}. Another agent is editing.")
+        _notify_creator(mcp, task_id, content)
+        return
+
+    try:
+        # 2. Wait for Syncthing to settle (ensure we have latest files)
+        if SYNCTHING_SETTLE_SECONDS > 0:
+            logger.info("Waiting %ds for Syncthing to settle", SYNCTHING_SETTLE_SECONDS)
+            time.sleep(SYNCTHING_SETTLE_SECONDS)
+
+        # 3. Run claude --print with Edit + Read + Bash tools
+        system_prompt = _build_system_prompt("code-edit", allowed_commands)
+        allowed_tools = "Edit Read Bash(.*)"
+
+        logger.info("Invoking claude --print for code-edit task %s", task_id)
+        try:
+            output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools)
+        except subprocess.TimeoutExpired:
+            mcp.edit(task_id, "- status: running", "- status: failed")
+            mcp.edit(task_id, "_(pending)_", f"_(timed out after {timeout}s)_")
+            append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
+            return
+
+        # 4. Git commit the changed files
+        commit_msg = f"[{AGENT_ID}] {request[:72]}"
+        git_result = git_commit_files(files, commit_msg)
+        logger.info("Git: %s", git_result)
+
+        # 5. Write result
+        result_text = output or "_(no output)_"
+        result_text += f"\n\n**Git:** {git_result}"
+        mcp.edit(task_id, "_(pending)_", result_text)
+        mcp.edit(task_id, "- status: running", "- status: completed")
+        append_log(mcp, task_id, AGENT_ID, f"Task completed. {git_result}")
+        logger.info("Code-edit task %s completed", task_id)
+
+    except Exception as e:
+        _fail_task(mcp, task_id, str(e))
+
+    finally:
+        # 6. Always release locks
+        release_locks(mcp, locked)
+
+    _notify_creator(mcp, task_id, content)
+
+
+def _fail_task(mcp: MCPClient, task_id: str, error: str):
+    """Mark a task as failed."""
+    try:
+        mcp.edit(task_id, "- status: running", "- status: failed")
+        mcp.edit(task_id, "_(pending)_", f"_(error: {error})_")
+        append_log(mcp, task_id, AGENT_ID, f"Task failed: {error}")
+    except Exception:
+        pass
+    logger.error("Task %s failed: %s", task_id, error)
+
+
+def _notify_creator(mcp: MCPClient, task_id: str, content: str):
+    """Best-effort notification to the task creator."""
     created_by = parse_task_field(content, "created_by")
     if created_by and created_by != AGENT_ID:
         try:

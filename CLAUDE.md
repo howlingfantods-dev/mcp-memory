@@ -24,13 +24,18 @@ When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs"
 
 3. **Tell the user** the task was dispatched and how to check results
 
-### Task template
+### Task types
+
+There are two task types: **query** (default) and **code-edit**.
+
+#### Query task (check something, report output)
 
 ```markdown
 # Task: {short-desc}
 
 ## Meta
 - status: pending
+- type: query
 - created: {ISO 8601 UTC timestamp}
 - created_by: {this machine's agent ID, or "user" if interactive}
 - target: {target agent_id}
@@ -49,6 +54,43 @@ _(pending)_
 ## Log
 - {timestamp} [{creator}] Created task
 ```
+
+#### Code-edit task (modify files in the synced repo)
+
+The daemon automatically handles: lock acquisition → edit → git commit → lock release.
+
+```markdown
+# Task: {short-desc}
+
+## Meta
+- status: pending
+- type: code-edit
+- created: {ISO 8601 UTC timestamp}
+- created_by: {this machine's agent ID, or "user" if interactive}
+- target: {target agent_id}
+- files: {comma-separated list of files to edit, e.g. agent_daemon.py, mcp_client.py}
+- timeout: 300
+
+## Request
+{What to change — be specific about the desired behavior}
+
+## Allowed Commands
+- {any shell commands needed, e.g. running tests}
+
+## Result
+_(pending)_
+
+## Log
+- {timestamp} [{creator}] Created task
+```
+
+The `files` field is required for code-edit tasks. The daemon will:
+1. Acquire MCP file locks for each listed file
+2. Wait for Syncthing to settle (ensure latest files)
+3. Run `claude --print` with Edit, Read, and Bash tools
+4. Git add + commit the changed files
+5. Release all locks
+6. Syncthing propagates the commit to all machines
 
 ### Common allowed commands by platform
 
@@ -77,14 +119,10 @@ When the user asks about a dispatched task ("what did thinkpad say?", "is it don
 3. If status is `running` or `pending` → let the user know it's still in progress
 4. If status is `failed` → show the error
 
-## File Locking (for code edits via Syncthing)
+## File Locking
 
-When an agent needs to edit files in the synced repo:
+File locking is handled automatically by the daemon for `code-edit` tasks. Lock files are stored in the MCP server as `lock-{safe-filename}.md`. Stale locks (holder offline >10 min) are broken automatically.
 
-1. **Check** for existing lock: `read_memory("lock-{safe-filename}.md")`
-   - If it exists, another agent is editing — wait or work on something else
-2. **Lock**: `write_memory("lock-{safe-filename}.md", "- holder: {agent_id}\n- acquired: {timestamp}\n- file: {filename}\n")`
-3. **Edit** the file, commit locally with git
-4. **Unlock**: `delete_memory("lock-{safe-filename}.md")`
-
-Stale lock recovery: if the holder's `agent-reg-{id}.md` shows `status: offline` and `last_seen` is >10 minutes ago, the lock can be broken.
+If you need to manually check or break a lock:
+- Check: `read_memory("lock-{safe-filename}.md")` (e.g. `lock-agent-daemon-py.md`)
+- Break: `delete_memory("lock-{safe-filename}.md")`
