@@ -468,7 +468,18 @@ def execute_task(mcp: MCPClient, task_id: str):
     timeout = int(parse_task_field(content, "timeout") or MAX_TASK_DURATION)
     task_type = parse_task_field(content, "type") or "query"
     files = parse_files_list(content)
-    depth = int(parse_task_field(content, "depth") or "0")
+    raw_depth = parse_task_field(content, "depth")
+    created_by = parse_task_field(content, "created_by")
+
+    # Only user-originated tasks can start at depth 0.
+    # Agent-originated tasks must carry a depth field from their parent.
+    # If an agent tries to create a task without depth, refuse it.
+    if created_by and created_by != "howlingfantods_" and not raw_depth:
+        _fail_task(mcp, task_id, "Agent-originated tasks must include a depth field. Only user requests can start new chains.")
+        _notify_creator(mcp, task_id, content)
+        return
+
+    depth = int(raw_depth) if raw_depth else 0
 
     MAX_DEPTH = 5
     if depth >= MAX_DEPTH:
@@ -532,8 +543,7 @@ def _execute_query(mcp: MCPClient, task_id: str, request: str,
                    depth: int = 0):
     """Execute a query task (check something, report output)."""
     system_prompt = _build_system_prompt("query", allowed_commands)
-    if depth > 0:
-        system_prompt += f"\nThis task is at dispatch depth {depth}/{5}. If you sub-dispatch, set depth to {depth + 1}."
+    system_prompt += f"\nThis task is at dispatch depth {depth}/5. If you sub-dispatch to another agent, you MUST set depth to {depth + 1} in the task. Tasks without a depth field from agents will be rejected."
 
     logger.info("Invoking claude --print for query task %s", task_id)
     try:
