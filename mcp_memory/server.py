@@ -343,6 +343,7 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
 
     evt = {
         "action": action,
+        "tool": "notify_agent",
         "task": task_id,
         "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
         "to": agent_id,
