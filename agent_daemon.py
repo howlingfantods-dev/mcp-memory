@@ -1,5 +1,3 @@
-# Race test by wsl
-# Edited by wsl
 #!/usr/bin/env python3
 """Agent daemon — connects to MCP server via SSE, executes tasks on demand.
 
@@ -20,8 +18,6 @@ Environment variables:
     MAX_TASK_DURATION  - Max seconds for task execution (default: 300)
     BLOCKED_PATHS      - Comma-separated paths to block (default: "/etc,/boot,~/.ssh")
 """
-
-VERSION = "0.2.0"
 
 import json
 import logging
