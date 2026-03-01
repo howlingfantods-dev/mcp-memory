@@ -1,0 +1,14 @@
+[Unit]
+Description=MCP Memory Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mcp-memory
+ExecStart=/root/.local/bin/uv run python3 main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
