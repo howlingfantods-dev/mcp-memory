@@ -12,9 +12,35 @@ This repo runs agent daemons on multiple machines, coordinated through the MCP m
 | @mac | mac | macOS | MacBook |
 | @vps | vps | Ubuntu 24.04 | Hetzner VPS, runs MCP server |
 
+## Node Identity
+
+Each node should know who it is. To identify yourself:
+- Read `devices.json` via `read_memory("devices.json")` — it maps OAuth client_ids to device names, specs, and aliases.
+- Your hostname or platform can also be matched against the Machines table above.
+- Always refer to other nodes by their `@alias` (e.g. `@power`, `@wsl`, `@arch`).
+- Use your own alias when setting `created_by` in task files.
+
+## Inter-Node Communication
+
+When you need information that another node is uniquely positioned to provide — **dispatch a task to that node** instead of telling the user you can't access it or asking them to check manually.
+
+Examples of when to dispatch:
+- You need GPU stats → dispatch to `@power` (it has the RTX 5070 Ti)
+- You need to check a Windows service → dispatch to `@power`
+- You need a macOS-specific check → dispatch to `@mac`
+- You need to verify something on the VPS → dispatch to `@vps`
+- You need Linux system info from the laptop → dispatch to `@arch`
+
+Examples of when NOT to dispatch:
+- The info is available locally on your own node
+- The user already provided the info
+- The question is about code/files synced across all nodes (just read locally)
+
+When two or more nodes are running interactive sessions simultaneously, they can coordinate through the MCP server: read each other's recent task files, check agent registration status, or dispatch queries directly.
+
 ## @ Dispatch Convention
 
-When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs", "@legion what's GPU usage"), dispatch a task to that machine:
+When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs", "@power what's GPU usage"), or when you determine another node can answer better, dispatch a task to that machine:
 
 1. **Create the task file** with `write_memory`:
    - Filename: `task-YYYYMMDD-HHMM-{short-desc}.json`
