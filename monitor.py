@@ -56,6 +56,20 @@ def format_tokens(tok_in, tok_out) -> str:
     return f"{_fmt(tok_in)}/{_fmt(tok_out)} tok"
 
 
+def _caller_tag(event: dict, use_color: bool) -> str:
+    device = event.get("device")
+    client = event.get("client")
+    if device:
+        tag = device
+    elif client:
+        tag = client[:8]
+    else:
+        return ""
+    if use_color:
+        return f" {DIM}[{tag}]{RESET}"
+    return f" [{tag}]"
+
+
 def format_event(event: dict, use_color: bool) -> str:
     etype = event.get("type", "unknown")
     ts = event.get("ts", "")
@@ -64,7 +78,7 @@ def format_event(event: dict, use_color: bool) -> str:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
             ts = dt.strftime("%H:%M:%S")
         except Exception:
-            ts = ts[-8:]  # fallback: last 8 chars
+            ts = ts[-8:]
     else:
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -72,6 +86,7 @@ def format_event(event: dict, use_color: bool) -> str:
     reset = RESET if use_color else ""
 
     label = etype.upper().ljust(10)
+    caller = _caller_tag(event, use_color)
 
     if etype in ("connect", "disconnect"):
         detail = event.get("agent", "")
@@ -84,13 +99,21 @@ def format_event(event: dict, use_color: bool) -> str:
         parts = [f"{ts} {color}{label}{reset} {tool.ljust(14)} {f}"]
         if b is not None:
             parts.append(format_bytes(b))
-        return "  ".join(parts)
+        # Show query params
+        prefix = event.get("prefix")
+        if prefix:
+            parts.append(f"prefix={prefix}")
+        query = event.get("query")
+        if query:
+            parts.append(f"q=\"{query}\"")
+        parts.append(caller.lstrip())
+        return "  ".join(p for p in parts if p)
 
     if etype == "notify":
         agent = event.get("agent", "")
         task = event.get("task", "")
         online = "online" if event.get("online") else "offline"
-        return f"{ts} {color}{label}{reset} {agent.ljust(14)} {task}  {online}"
+        return f"{ts} {color}{label}{reset} {agent.ljust(14)} {task}  {online}{caller}"
 
     if etype == "task":
         task = event.get("task", "")
@@ -127,7 +150,6 @@ def parse_filters(filter_args: list[str] | None) -> dict:
 
 
 def stream_monitor(url: str, use_color: bool, filters: dict):
-    # Use MCPClient just for OAuth token
     client = MCPClient(url, token_name="monitor")
     client._ensure_auth()
     token = client._access_token
@@ -153,7 +175,6 @@ def stream_monitor(url: str, use_color: bool, filters: dict):
                             block = block.strip()
                             if not block or block.startswith(":"):
                                 continue
-                            # Parse SSE event
                             data_line = None
                             for line in block.splitlines():
                                 if line.startswith("data: "):

@@ -10,7 +10,7 @@ from mcp.server.auth.settings import (
     ClientRegistrationOptions,
     RevocationOptions,
 )
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from mcp_memory.config import DATA_DIR
@@ -39,6 +39,7 @@ mcp = FastMCP(
 logger = logging.getLogger("mcp-memory")
 
 FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.(md|json)$")
+DEVICES_FILE = DATA_DIR / "devices.json"
 
 
 def _validate_filename(filename: str) -> Path:
@@ -53,8 +54,44 @@ def _validate_filename(filename: str) -> Path:
     return path
 
 
+# ── Device lookup ────────────────────────────────────────────────────
+
+def _load_devices() -> dict:
+    if DEVICES_FILE.exists():
+        try:
+            return json.loads(DEVICES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_devices(devices: dict):
+    DEVICES_FILE.write_text(json.dumps(devices, indent=2) + "\n")
+
+
+def _resolve_device(client_id: str | None) -> str | None:
+    if not client_id:
+        return None
+    devices = _load_devices()
+    entry = devices.get(client_id)
+    return entry.get("name") if entry else None
+
+
+def _client_fields(ctx: Context) -> dict:
+    cid = ctx.client_id
+    fields = {}
+    if cid:
+        fields["client"] = cid
+        device = _resolve_device(cid)
+        if device:
+            fields["device"] = device
+    return fields
+
+
+# ── Tools ────────────────────────────────────────────────────────────
+
 @mcp.tool()
-def list_memories(prefix: str = "") -> str:
+def list_memories(prefix: str = "", ctx: Context = None) -> str:
     """List all markdown memory files.
 
     Args:
@@ -65,13 +102,18 @@ def list_memories(prefix: str = "") -> str:
     )
     if prefix:
         files = [f for f in files if f.startswith(prefix)]
+    evt = {"type": "tool", "tool": "list_memories"}
+    if prefix:
+        evt["prefix"] = prefix
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     if not files:
         return "No memory files found."
     return "\n".join(files)
 
 
 @mcp.tool()
-def read_memory(filename: str) -> str:
+def read_memory(filename: str, ctx: Context = None) -> str:
     """Read the contents of a memory file.
 
     Args:
@@ -80,12 +122,14 @@ def read_memory(filename: str) -> str:
     path = _validate_filename(filename)
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
-    emit_monitor_event({"type": "tool", "tool": "read_memory", "file": filename})
+    evt = {"type": "tool", "tool": "read_memory", "file": filename}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     return path.read_text()
 
 
 @mcp.tool()
-def write_memory(filename: str, content: str) -> str:
+def write_memory(filename: str, content: str, ctx: Context = None) -> str:
     """Create or overwrite a memory file.
 
     Args:
@@ -94,7 +138,9 @@ def write_memory(filename: str, content: str) -> str:
     """
     path = _validate_filename(filename)
     path.write_text(content)
-    emit_monitor_event({"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content)})
+    evt = {"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content)}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     if filename.startswith("task-") and filename.endswith(".json"):
         _emit_task_event(filename, content)
     return f"Wrote {len(content)} bytes to {filename}."
@@ -106,7 +152,6 @@ def _emit_task_event(filename: str, content: str):
         evt = {"type": "task", "task": filename, "status": task.get("status", "")}
         if task.get("target"):
             evt["agent"] = task["target"]
-        # Look for log entries to find claiming/executing agent
         log = task.get("log", [])
         if log:
             evt["agent"] = log[-1].get("agent", evt.get("agent", ""))
@@ -122,7 +167,7 @@ def _emit_task_event(filename: str, content: str):
 
 
 @mcp.tool()
-def edit_memory(filename: str, old_text: str, new_text: str) -> str:
+def edit_memory(filename: str, old_text: str, new_text: str, ctx: Context = None) -> str:
     """Find and replace text in a memory file.
 
     Args:
@@ -138,17 +183,22 @@ def edit_memory(filename: str, old_text: str, new_text: str) -> str:
         raise ValueError(f"Text not found in '{filename}'.")
     new_content = content.replace(old_text, new_text, 1)
     path.write_text(new_content)
-    emit_monitor_event({"type": "tool", "tool": "edit_memory", "file": filename})
+    evt = {"type": "tool", "tool": "edit_memory", "file": filename}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     return f"Replaced text in {filename}."
 
 
 @mcp.tool()
-def search_memories(query: str) -> str:
+def search_memories(query: str, ctx: Context = None) -> str:
     """Search across all memory files for matching text.
 
     Args:
         query: Text to search for (case-insensitive)
     """
+    evt = {"type": "tool", "tool": "search_memories", "query": query}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     results = []
     for path in sorted(
         p for ext in ("*.md", "*.json") for p in DATA_DIR.glob(ext)
@@ -171,7 +221,7 @@ def search_memories(query: str) -> str:
 
 
 @mcp.tool()
-def delete_memory(filename: str) -> str:
+def delete_memory(filename: str, ctx: Context = None) -> str:
     """Delete a memory file.
 
     Args:
@@ -181,13 +231,13 @@ def delete_memory(filename: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     path.unlink()
-    emit_monitor_event({"type": "tool", "tool": "delete_memory", "file": filename})
+    evt = {"type": "tool", "tool": "delete_memory", "file": filename}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
     return f"Deleted {filename}."
 
 
 # ── SSE event queues ─────────────────────────────────────────────────
-# Each connected agent holds an asyncio.Queue. notify_agent pushes to it,
-# the SSE endpoint in main.py streams from it. No outbound HTTP needed.
 
 _agent_queues: dict[str, set[asyncio.Queue]] = {}
 
@@ -239,7 +289,7 @@ def emit_monitor_event(event: dict):
 
 
 @mcp.tool()
-async def notify_agent(agent_id: str, task_id: str) -> str:
+async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     """Send a notification to an agent about a new task.
 
     The agent must be connected via SSE to receive the notification.
@@ -260,7 +310,9 @@ async def notify_agent(agent_id: str, task_id: str) -> str:
 
     queues = _agent_queues.get(agent_id, set())
     online = bool(queues)
-    emit_monitor_event({"type": "notify", "agent": agent_id, "task": task_id, "online": online})
+    evt = {"type": "notify", "agent": agent_id, "task": task_id, "online": online}
+    evt.update(_client_fields(ctx))
+    emit_monitor_event(evt)
 
     if not queues:
         return (
@@ -272,3 +324,38 @@ async def notify_agent(agent_id: str, task_id: str) -> str:
         await q.put(task_id)
 
     return f"Notified agent '{agent_id}' about task '{task_id}'."
+
+
+@mcp.tool()
+def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gpu: str = "", ctx: Context = None) -> str:
+    """Register the calling client's device info for monitor display.
+
+    Maps the caller's OAuth client_id to a human-readable device name with specs.
+    Call this once per device to populate the lookup table.
+
+    Args:
+        name: Short device name (e.g. "thinkpad", "power")
+        model: Hardware model (e.g. "ThinkPad X1 Carbon Gen 11")
+        cpu: CPU model
+        ram: RAM spec
+        gpu: GPU model
+    """
+    cid = ctx.client_id if ctx else None
+    if not cid:
+        return "Cannot register: no client_id available in this session."
+
+    devices = _load_devices()
+    entry = {"name": name}
+    if model:
+        entry["model"] = model
+    if cpu:
+        entry["cpu"] = cpu
+    if ram:
+        entry["ram"] = ram
+    if gpu:
+        entry["gpu"] = gpu
+    devices[cid] = entry
+    _save_devices(devices)
+
+    emit_monitor_event({"type": "tool", "tool": "register_device", "device": name, "client": cid})
+    return f"Registered client {cid[:8]}... as '{name}'."
