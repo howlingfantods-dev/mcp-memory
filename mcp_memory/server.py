@@ -314,6 +314,7 @@ def _set_task_target(content: str, agent_id: str) -> str:
     return "\n".join(new_lines)
 
 
+@mcp.tool()
 async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     """Send a notification to an agent about a new task.
 
