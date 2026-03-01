@@ -1,3 +1,4 @@
+# Edited by legion
 #!/usr/bin/env python3
 """Agent daemon — connects to MCP server via SSE, executes tasks on demand.
 
