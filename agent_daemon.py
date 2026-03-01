@@ -647,7 +647,14 @@ def parse_sse_event(text: str) -> str | None:
 
 def sse_listen(mcp: MCPClient, sse_url: str):
     """Connect to SSE endpoint and process task notifications. Reconnects on drop."""
+    first_connect = True
     while True:
+        if not first_connect:
+            # On reconnect, check for upstream updates and restart if needed
+            if check_self_update():
+                logger.info("Code updated, exiting for restart...")
+                sys.exit(0)
+        first_connect = False
         try:
             logger.info("Connecting to SSE: %s", sse_url)
             with httpx.Client(timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10)) as client:
@@ -746,6 +753,52 @@ def check_pending_tasks(mcp: MCPClient):
                 pass
     except Exception as e:
         logger.debug("Pending task check failed: %s", e)
+
+
+# ── Self-update on reconnect ──────────────────────────────────────────
+
+def check_self_update() -> bool:
+    """Check if the repo has upstream changes and pull + restart if so.
+
+    Returns True if an update was applied (caller should exit so systemd restarts us).
+    """
+    try:
+        # Fetch latest from origin
+        result = subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            capture_output=True, text=True, timeout=15,
+            cwd=REPO_DIR,
+        )
+        if result.returncode != 0:
+            logger.debug("git fetch failed: %s", result.stderr.strip())
+            return False
+
+        # Check if we're behind
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            capture_output=True, text=True, timeout=5,
+            cwd=REPO_DIR,
+        )
+        behind = int(result.stdout.strip() or "0")
+        if behind == 0:
+            return False
+
+        logger.info("Behind origin/main by %d commit(s), pulling...", behind)
+        result = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", "main"],
+            capture_output=True, text=True, timeout=30,
+            cwd=REPO_DIR,
+        )
+        if result.returncode != 0:
+            logger.warning("git pull failed: %s", result.stderr.strip())
+            return False
+
+        logger.info("Updated: %s", result.stdout.strip())
+        return True
+
+    except Exception as e:
+        logger.debug("Self-update check failed: %s", e)
+        return False
 
 
 # ── Main ─────────────────────────────────────────────────────────────
