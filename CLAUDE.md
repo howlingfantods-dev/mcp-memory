@@ -22,21 +22,22 @@ Each node should know who it is. To identify yourself:
 
 ## Inter-Node Communication
 
-When you need information that another node is uniquely positioned to provide — **dispatch a task to that node** instead of telling the user you can't access it or asking them to check manually.
+**Never ask the user to relay information between nodes.** If you need something from another node, dispatch a task to it directly. That is what this architecture is for.
 
-Examples of when to dispatch:
-- You need GPU stats → dispatch to `@power` (it has the RTX 5070 Ti)
-- You need to check a Windows service → dispatch to `@power`
-- You need a macOS-specific check → dispatch to `@mac`
-- You need to verify something on the VPS → dispatch to `@vps`
-- You need Linux system info from the laptop → dispatch to `@arch`
+This applies whether you are an agent daemon or an interactive Claude session. If the answer lives on another machine, dispatch — don't ask the user to copy-paste between prompts.
 
-Examples of when NOT to dispatch:
+Agents should proactively marshal other agents when:
+- You need platform-specific info (GPU stats from `@power`, battery from `@mac`, etc.)
+- You need to verify or act on something outside your node
+- A subtask would be faster or better handled by another node
+- You need to coordinate a change across multiple machines
+
+Do NOT dispatch when:
 - The info is available locally on your own node
 - The user already provided the info
 - The question is about code/files synced across all nodes (just read locally)
 
-When two or more nodes are running interactive sessions simultaneously, they can coordinate through the MCP server: read each other's recent task files, check agent registration status, or dispatch queries directly.
+Agents can also chain tasks — `@thinkpad` can dispatch to `@vps`, which dispatches to `@power`, with results flowing back through the response events.
 
 ## @ Dispatch Convention
 
