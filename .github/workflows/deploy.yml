@@ -1,0 +1,20 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 5.161.239.81
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /root/mcp-memory
+            git pull --ff-only
+            systemctl restart mcp-memory
