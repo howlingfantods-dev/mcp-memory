@@ -120,7 +120,7 @@ def list_memories(prefix: str = "", ctx: Context = None) -> str:
     if prefix:
         files = [f for f in files if f.startswith(prefix)]
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "list_memories", "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "list_memories", "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     if prefix:
         evt["prefix"] = prefix
     evt.update(cf)
@@ -141,7 +141,7 @@ def read_memory(filename: str, ctx: Context = None) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "read_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "read_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return path.read_text()
@@ -158,7 +158,7 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
     path = _validate_filename(filename)
     path.write_text(content)
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content), "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "write_memory", "file": filename, "bytes": len(content), "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     if filename.startswith("task-") and filename.endswith(".json"):
@@ -169,7 +169,7 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
 def _emit_task_event(filename: str, content: str):
     try:
         task = json.loads(content)
-        evt = {"type": "task", "task": filename, "status": task.get("status", "")}
+        evt = {"action": "task", "task": filename, "status": task.get("status", "")}
         if task.get("target"):
             evt["agent"] = task["target"]
         log = task.get("log", [])
@@ -204,7 +204,7 @@ def edit_memory(filename: str, old_text: str, new_text: str, ctx: Context = None
     new_content = content.replace(old_text, new_text, 1)
     path.write_text(new_content)
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "edit_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "edit_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return f"Replaced text in {filename}."
@@ -218,7 +218,7 @@ def search_memories(query: str, ctx: Context = None) -> str:
         query: Text to search for (case-insensitive)
     """
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "search_memories", "query": query, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "search_memories", "query": query, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     results = []
@@ -254,7 +254,7 @@ def delete_memory(filename: str, ctx: Context = None) -> str:
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     path.unlink()
     cf = _client_fields(ctx)
-    evt = {"type": "tool", "tool": "delete_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "tool", "tool": "delete_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return f"Deleted {filename}."
@@ -269,7 +269,7 @@ def agent_subscribe(agent_id: str) -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue()
     _agent_queues.setdefault(agent_id, set()).add(q)
     logger.info("Agent '%s' subscribed to SSE (%d listeners)", agent_id, len(_agent_queues[agent_id]))
-    emit_monitor_event({"type": "connect", "agent": agent_id})
+    emit_monitor_event({"action": "connect", "agent": agent_id})
     return q
 
 
@@ -279,7 +279,7 @@ def agent_unsubscribe(agent_id: str, q: asyncio.Queue):
         if not _agent_queues[agent_id]:
             del _agent_queues[agent_id]
     logger.info("Agent '%s' unsubscribed from SSE", agent_id)
-    emit_monitor_event({"type": "disconnect", "agent": agent_id})
+    emit_monitor_event({"action": "disconnect", "agent": agent_id})
 
 
 # ── Monitor event bus ─────────────────────────────────────────────────
@@ -336,7 +336,7 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     online = bool(queues)
     cf = _client_fields(ctx)
     evt = {
-        "type": "notify",
+        "action": "notify",
         "task": task_id,
         "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
         "to": agent_id,
@@ -415,5 +415,5 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
     devices[cid] = merged
     _save_devices(devices)
 
-    emit_monitor_event({"type": "tool", "tool": "register_device", "device": name, "client": cid})
+    emit_monitor_event({"action": "tool", "tool": "register_device", "device": name, "client": cid})
     return f"Registered client {cid[:8]}... as '{name}'."

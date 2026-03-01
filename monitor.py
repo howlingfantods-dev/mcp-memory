@@ -8,7 +8,7 @@ connections, notifications).
 Usage:
     python3 monitor.py
     python3 monitor.py --no-color
-    python3 monitor.py --filter type=task
+    python3 monitor.py --filter action=task
     python3 monitor.py --filter agent=thinkpad
 """
 
@@ -71,7 +71,7 @@ def _caller_tag(event: dict, use_color: bool) -> str:
 
 
 def format_event(event: dict, use_color: bool) -> str:
-    etype = event.get("type", "unknown")
+    etype = event.get("action", "unknown")
     ts = event.get("ts", "")
     if ts:
         try:
@@ -218,7 +218,7 @@ def main():
     parser = argparse.ArgumentParser(description="MCP server activity monitor")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument("--filter", action="append", dest="filters",
-                        metavar="KEY=VAL", help="Filter events (e.g. type=task, agent=thinkpad)")
+                        metavar="KEY=VAL", help="Filter events (e.g. action=task, agent=thinkpad)")
     args = parser.parse_args()
 
     use_color = not args.no_color and sys.stdout.isatty()
