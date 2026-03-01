@@ -37,7 +37,6 @@ EVENT_COLORS = {
     "connect": GREEN,
     "disconnect": RED,
     "task": YELLOW,
-    "tool": CYAN,
     "request": YELLOW,
     "response": GREEN,
 }
@@ -93,11 +92,11 @@ def format_event(event: dict, use_color: bool) -> str:
         detail = event.get("agent", "")
         return f"{ts} {color}{label}{reset} {detail}"
 
-    if etype == "tool":
+    if etype == "request" and "tool" in event:
         eid = event.get("id", "")
         tool = event.get("tool", "").replace("_memory", "")
         sender = event.get("from", "")
-        f = event.get("file", "")
+        f = event.get("resource", "")
         b = event.get("bytes")
         id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
         from_tag = f"{BOLD}@{sender}{RESET} " if use_color and sender else f"@{sender} " if sender else ""
@@ -112,7 +111,7 @@ def format_event(event: dict, use_color: bool) -> str:
             parts.append(f"q=\"{query}\"")
         return "  ".join(p for p in parts if p)
 
-    if etype in ("request", "response"):
+    if etype in ("request", "response") and "tool" not in event:
         eid = event.get("id", "")
         sender = event.get("from", "")
         receiver = event.get("to", "")

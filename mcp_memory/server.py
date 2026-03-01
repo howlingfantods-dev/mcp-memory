@@ -120,7 +120,7 @@ def list_memories(prefix: str = "", ctx: Context = None) -> str:
     if prefix:
         files = [f for f in files if f.startswith(prefix)]
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "list_memories", "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "list_memories", "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     if prefix:
         evt["prefix"] = prefix
     evt.update(cf)
@@ -141,7 +141,7 @@ def read_memory(filename: str, ctx: Context = None) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "read_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "read_memory", "resource": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return path.read_text()
@@ -158,7 +158,7 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
     path = _validate_filename(filename)
     path.write_text(content)
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "write_memory", "file": filename, "bytes": len(content), "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "write_memory", "resource": filename, "bytes": len(content), "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     if filename.startswith("task-") and filename.endswith(".json"):
@@ -204,7 +204,7 @@ def edit_memory(filename: str, old_text: str, new_text: str, ctx: Context = None
     new_content = content.replace(old_text, new_text, 1)
     path.write_text(new_content)
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "edit_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "edit_memory", "resource": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return f"Replaced text in {filename}."
@@ -218,7 +218,7 @@ def search_memories(query: str, ctx: Context = None) -> str:
         query: Text to search for (case-insensitive)
     """
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "search_memories", "query": query, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "search_memories", "query": query, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     results = []
@@ -254,7 +254,7 @@ def delete_memory(filename: str, ctx: Context = None) -> str:
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     path.unlink()
     cf = _client_fields(ctx)
-    evt = {"action": "tool", "tool": "delete_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt = {"action": "request", "tool": "delete_memory", "resource": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     evt.update(cf)
     emit_monitor_event(evt)
     return f"Deleted {filename}."
@@ -428,5 +428,5 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
     devices[cid] = merged
     _save_devices(devices)
 
-    emit_monitor_event({"action": "tool", "tool": "register_device", "device": name, "client": cid})
+    emit_monitor_event({"action": "request", "tool": "register_device", "device": name, "client": cid})
     return f"Registered client {cid[:8]}... as '{name}'."
