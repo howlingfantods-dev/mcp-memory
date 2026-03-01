@@ -159,20 +159,39 @@ def update_heartbeat(mcp: MCPClient):
 
 # ── Task Handling ────────────────────────────────────────────────────
 
-def parse_task_field(content: str, field: str) -> str:
-    """Extract a field value from task markdown.
+def _try_parse_json(content: str) -> dict | None:
+    """Try to parse content as JSON. Returns dict or None."""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
 
-    Supports two formats:
-      1. Meta-section style:  '- field: value'
-      2. Header style:        '## field\\nvalue'
-    """
+
+def parse_task_field(content: str, field: str) -> str:
+    """Extract a field value from task content (JSON or markdown)."""
+    # Try JSON first
+    data = _try_parse_json(content)
+    if data is not None:
+        val = data.get(field)
+        if val is None:
+            # Also check common aliases
+            aliases = {"assigned_to": "target", "target": "assigned_to"}
+            val = data.get(aliases.get(field, ""))
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            return ", ".join(str(v) for v in val)
+        return str(val)
+
+    # Markdown fallback
     lines = content.splitlines()
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # Format 1: '- field: value'
         if stripped.startswith(f"- {field}:"):
             return stripped[len(f"- {field}:"):].strip()
-        # Format 2: '## field' followed by value on next line
         if stripped.lower() == f"## {field}" and i + 1 < len(lines):
             val = lines[i + 1].strip()
             if val and not val.startswith("#"):
@@ -181,7 +200,12 @@ def parse_task_field(content: str, field: str) -> str:
 
 
 def parse_allowed_commands(content: str) -> list[str]:
-    """Extract allowed commands from the ## Allowed Commands section."""
+    """Extract allowed commands from task content (JSON or markdown)."""
+    data = _try_parse_json(content)
+    if data is not None:
+        cmds = data.get("allowed_commands", [])
+        return cmds if isinstance(cmds, list) else []
+
     commands = []
     in_section = False
     for line in content.splitlines():
@@ -198,7 +222,11 @@ def parse_allowed_commands(content: str) -> list[str]:
 
 
 def parse_request(content: str) -> str:
-    """Extract the request text from ## Request or ## prompt section."""
+    """Extract the request text from task content (JSON or markdown)."""
+    data = _try_parse_json(content)
+    if data is not None:
+        return data.get("request", "") or data.get("prompt", "")
+
     lines = []
     in_section = False
     for line in content.splitlines():
@@ -214,7 +242,14 @@ def parse_request(content: str) -> str:
 
 
 def parse_files_list(content: str) -> list[str]:
-    """Extract the files list from '- files: a.py, b.py' in task meta."""
+    """Extract the files list from task content (JSON or markdown)."""
+    data = _try_parse_json(content)
+    if data is not None:
+        files = data.get("files", [])
+        if isinstance(files, list):
+            return [f for f in files if f]
+        return []
+
     raw = parse_task_field(content, "files")
     if not raw:
         return []
@@ -357,48 +392,60 @@ def git_commit_files(files: list[str], message: str) -> str:
 
 
 def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str):
-    """Update task status, handling both meta-section and header formats."""
+    """Update task status (JSON or markdown)."""
     content = mcp.read(task_id)
+    data = _try_parse_json(content)
+    if data is not None:
+        data["status"] = new_status
+        mcp.write(task_id, json.dumps(data, indent=2))
+        return
     if f"- status: {old_status}" in content:
         mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
     elif f"## status\n{old_status}" in content:
         mcp.edit(task_id, f"## status\n{old_status}", f"## status\n{new_status}")
     else:
-        # Fallback: just try meta format
         mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
 
 
 def _edit_result(mcp: MCPClient, task_id: str, result_text: str):
-    """Write result text, handling both formats."""
+    """Write result text (JSON or markdown)."""
     content = mcp.read(task_id)
+    data = _try_parse_json(content)
+    if data is not None:
+        data["result"] = result_text
+        mcp.write(task_id, json.dumps(data, indent=2))
+        return
     if "_(pending)_" in content:
         mcp.edit(task_id, "_(pending)_", result_text)
     elif "## Result\n" in content:
-        # Result section exists but has different placeholder or content — replace after header
         old_section = content.split("## Result\n", 1)[1].split("\n## ", 1)[0]
         mcp.edit(task_id, f"## Result\n{old_section}", f"## Result\n{result_text}\n")
     elif "## result\n" in content:
         old_section = content.split("## result\n", 1)[1].split("\n## ", 1)[0]
         mcp.edit(task_id, f"## result\n{old_section}", f"## result\n{result_text}\n")
     else:
-        # No result section — insert one before status
         if "## status" in content:
             mcp.edit(task_id, "## status", f"## result\n{result_text}\n\n## status")
         elif "## Meta" in content:
             mcp.edit(task_id, "## Log", f"## Result\n{result_text}\n\n## Log")
         else:
-            # Last resort: append
             mcp.write(task_id, content + f"\n\n## Result\n{result_text}\n")
 
 
 def append_log(mcp: MCPClient, task_id: str, agent: str, message: str):
-    """Append a log entry to the task file."""
-    log_entry = f"\n- {now_iso()} [{agent}] {message}"
+    """Append a log entry to the task file (JSON or markdown)."""
     content = mcp.read(task_id)
+    data = _try_parse_json(content)
+    if data is not None:
+        if "log" not in data or not isinstance(data["log"], list):
+            data["log"] = []
+        data["log"].append({"ts": now_iso(), "agent": agent, "msg": message})
+        mcp.write(task_id, json.dumps(data, indent=2))
+        return
+    log_entry = f"\n- {now_iso()} [{agent}] {message}"
     if "## Log" in content:
         mcp.edit(task_id, "## Log", f"## Log{log_entry}")
     else:
-        # No log section — append one
         mcp.write(task_id, content + f"\n\n## Log{log_entry}")
 
 
@@ -410,8 +457,14 @@ def claim_task(mcp: MCPClient, task_id: str) -> bool:
         logger.info("Could not read task %s: %s", task_id, e)
         return False
     try:
-        # Try meta-section format first, then header format
-        if "- status: pending" in content:
+        data = _try_parse_json(content)
+        if data is not None:
+            if data.get("status") != "pending":
+                logger.info("Could not find pending status in task %s", task_id)
+                return False
+            data["status"] = "claimed"
+            mcp.write(task_id, json.dumps(data, indent=2))
+        elif "- status: pending" in content:
             mcp.edit(task_id, "- status: pending", "- status: claimed")
         elif "\n## status\npending" in content:
             mcp.edit(task_id, "## status\npending", "## status\nclaimed")
@@ -639,7 +692,8 @@ def _fail_task(mcp: MCPClient, task_id: str, error: str):
 
 def _notify_creator(mcp: MCPClient, task_id: str, content: str):
     """Best-effort notification to the task creator."""
-    created_by = parse_task_field(content, "created_by")
+    data = _try_parse_json(content)
+    created_by = data.get("created_by", "") if data else parse_task_field(content, "created_by")
     if created_by and created_by != AGENT_ID:
         try:
             mcp.notify_agent(created_by, task_id)
