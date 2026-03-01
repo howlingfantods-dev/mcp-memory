@@ -1,3 +1,4 @@
+# Race test by wsl
 # Edited by wsl
 #!/usr/bin/env python3
 """Agent daemon — connects to MCP server via SSE, executes tasks on demand.
@@ -209,16 +210,22 @@ def lock_filename(filepath: str) -> str:
 def acquire_locks(mcp: MCPClient, files: list[str]) -> list[str]:
     """Acquire MCP file locks for a list of files.
 
-    Returns list of files successfully locked. If any lock fails (already held
-    by another agent), releases all acquired locks and returns empty list.
+    Uses write-then-verify to avoid TOCTOU races: writes the lock, reads it
+    back, and only proceeds if we're the holder. If another agent won the race,
+    releases all acquired locks and returns empty list.
     """
     acquired = []
     for filepath in files:
         lf = lock_filename(filepath)
+
+        # Check for existing lock first
         try:
-            # Check if lock exists
             existing = mcp.read(lf)
-            # Lock exists — check if stale
+            # Lock exists — check if it's ours (re-entrant) or stale
+            if f"- holder: {AGENT_ID}" in existing:
+                acquired.append(filepath)
+                logger.info("Already hold lock: %s", filepath)
+                continue
             if _is_stale_lock(mcp, existing):
                 logger.info("Breaking stale lock on %s", filepath)
                 mcp.delete(lf)
@@ -229,12 +236,26 @@ def acquire_locks(mcp: MCPClient, files: list[str]) -> list[str]:
         except Exception:
             pass  # FileNotFoundError = not locked, proceed
 
+        # Write our lock
         lock_content = (
             f"- holder: {AGENT_ID}\n"
             f"- acquired: {now_iso()}\n"
             f"- file: {filepath}\n"
         )
         mcp.write(lf, lock_content)
+
+        # Verify we won the race — read it back
+        try:
+            readback = mcp.read(lf)
+            if f"- holder: {AGENT_ID}" not in readback:
+                logger.warning("Lost lock race on %s", filepath)
+                release_locks(mcp, acquired)
+                return []
+        except Exception:
+            logger.warning("Failed to verify lock on %s", filepath)
+            release_locks(mcp, acquired)
+            return []
+
         acquired.append(filepath)
         logger.info("Acquired lock: %s", filepath)
 
