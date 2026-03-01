@@ -295,9 +295,8 @@ NODE_CARD = """<div class="node {status_class}">
 </div>"""
 
 
-def _build_health_page() -> str:
-    """Build the health status HTML page."""
-    # Load devices
+def _get_node_statuses() -> list[dict]:
+    """Return status info for all registered nodes."""
     devices_path = DATA_DIR / "devices.json"
     devices = {}
     if devices_path.exists():
@@ -306,7 +305,6 @@ def _build_health_page() -> str:
         except Exception:
             pass
 
-    # Deduplicate by name (multiple client_ids can map to same device)
     seen = {}
     for cid, entry in devices.items():
         name = entry.get("name", cid[:8])
@@ -316,12 +314,11 @@ def _build_health_page() -> str:
     connected_agents = set(_agent_queues.keys())
     now = datetime.now(timezone.utc)
 
-    cards = []
+    nodes = []
     for name in sorted(seen.keys()):
         entry = seen[name]
         has_sse = name in connected_agents
 
-        # Get last_seen from agent registration
         last_seen = ""
         heartbeat_ago = None
         reg_path = DATA_DIR / f"agent-reg-{name}.md"
@@ -345,24 +342,50 @@ def _build_health_page() -> str:
             except Exception:
                 pass
 
-        # SSE connection can linger after sleep — verify with heartbeat
         online = has_sse and (heartbeat_ago is None or heartbeat_ago < HEARTBEAT_STALE_SECONDS)
-        status = "online" if online else "offline"
-        status_class = status
+        nodes.append({
+            "name": name,
+            "status": "online" if online else "offline",
+            "last_seen": last_seen,
+            "aliases": entry.get("aliases", ""),
+            "model": entry.get("model", ""),
+            "os": entry.get("os", ""),
+            "env": entry.get("env", ""),
+        })
+
+    return nodes
+
+
+def _build_health_page() -> str:
+    """Build the health status HTML page."""
+    nodes = _get_node_statuses()
+    now = datetime.now(timezone.utc)
+
+    cards = []
+    for node in nodes:
+        name = node["name"]
+        status = node["status"]
+        entry_path = DATA_DIR / "devices.json"
+        # Re-read full entry for hardware details
+        entry = {}
+        try:
+            devices = json.loads(entry_path.read_text())
+            for cid, e in devices.items():
+                if e.get("name") == name:
+                    entry = e
+                    break
+        except Exception:
+            pass
 
         details = []
-        aliases = entry.get("aliases", "")
-        if aliases:
-            details.append(f"<b>{aliases}</b>")
-        model = entry.get("model", "")
-        if model:
-            details.append(model)
-        os_name = entry.get("os", "")
-        env = entry.get("env", "")
-        if os_name:
-            platform = os_name
-            if env and env != "bare metal":
-                platform += f" ({env})"
+        if node["aliases"]:
+            details.append(f"<b>{node['aliases']}</b>")
+        if node["model"]:
+            details.append(node["model"])
+        if node["os"]:
+            platform = node["os"]
+            if node["env"] and node["env"] != "bare metal":
+                platform += f" ({node['env']})"
             details.append(platform)
         cpu = entry.get("cpu", "")
         if cpu:
@@ -374,13 +397,13 @@ def _build_health_page() -> str:
         if gpu and "Virtio" not in gpu:
             short_gpu = gpu.split("(")[0].strip() if len(gpu) > 40 else gpu
             details.append(f"GPU: <span>{short_gpu}</span>")
-        if last_seen:
-            details.append(f"Last seen: <span>{last_seen}</span>")
+        if node["last_seen"]:
+            details.append(f"Last seen: <span>{node['last_seen']}</span>")
 
         cards.append(NODE_CARD.format(
             name=f"@{name}",
             status=status,
-            status_class=status_class,
+            status_class=status,
             details="<br>".join(details),
         ))
 
@@ -406,6 +429,26 @@ async def handle_health(scope, receive, send):
     })
 
 
+async def handle_health_json(scope, receive, send):
+    """GET /health.json — machine-readable node status."""
+    nodes = _get_node_statuses()
+    data = {n["name"]: {"status": n["status"], "last_seen": n["last_seen"]} for n in nodes}
+    body = json.dumps(data).encode()
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+            (b"access-control-allow-origin", b"*"),
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": body,
+    })
+
+
 # ── ASGI app ─────────────────────────────────────────────────────────
 
 async def app(scope, receive, send):
@@ -420,6 +463,9 @@ async def app(scope, receive, send):
             return
         if path.rstrip("/") == "/health":
             await handle_health(scope, receive, send)
+            return
+        if path.rstrip("/") == "/health.json":
+            await handle_health_json(scope, receive, send)
             return
     await patch_metadata_middleware(scope, receive, send)
 
