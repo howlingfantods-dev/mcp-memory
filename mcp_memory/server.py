@@ -42,6 +42,13 @@ logger = logging.getLogger("mcp-memory")
 FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.(md|json)$")
 DEVICES_FILE = DATA_DIR / "devices.json"
 
+_event_id = 0
+
+def _next_event_id() -> int:
+    global _event_id
+    _event_id += 1
+    return _event_id
+
 
 def _validate_filename(filename: str) -> Path:
     if not FILENAME_RE.match(filename):
@@ -112,10 +119,11 @@ def list_memories(prefix: str = "", ctx: Context = None) -> str:
     )
     if prefix:
         files = [f for f in files if f.startswith(prefix)]
-    evt = {"type": "tool", "tool": "list_memories"}
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "list_memories", "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
     if prefix:
         evt["prefix"] = prefix
-    evt.update(_client_fields(ctx))
+    evt.update(cf)
     emit_monitor_event(evt)
     if not files:
         return "No memory files found."
@@ -132,8 +140,9 @@ def read_memory(filename: str, ctx: Context = None) -> str:
     path = _validate_filename(filename)
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
-    evt = {"type": "tool", "tool": "read_memory", "file": filename}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "read_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt.update(cf)
     emit_monitor_event(evt)
     return path.read_text()
 
@@ -148,8 +157,9 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
     """
     path = _validate_filename(filename)
     path.write_text(content)
-    evt = {"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content)}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "write_memory", "file": filename, "bytes": len(content), "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt.update(cf)
     emit_monitor_event(evt)
     if filename.startswith("task-") and filename.endswith(".json"):
         _emit_task_event(filename, content)
@@ -193,8 +203,9 @@ def edit_memory(filename: str, old_text: str, new_text: str, ctx: Context = None
         raise ValueError(f"Text not found in '{filename}'.")
     new_content = content.replace(old_text, new_text, 1)
     path.write_text(new_content)
-    evt = {"type": "tool", "tool": "edit_memory", "file": filename}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "edit_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt.update(cf)
     emit_monitor_event(evt)
     return f"Replaced text in {filename}."
 
@@ -206,8 +217,9 @@ def search_memories(query: str, ctx: Context = None) -> str:
     Args:
         query: Text to search for (case-insensitive)
     """
-    evt = {"type": "tool", "tool": "search_memories", "query": query}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "search_memories", "query": query, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt.update(cf)
     emit_monitor_event(evt)
     results = []
     for path in sorted(
@@ -241,8 +253,9 @@ def delete_memory(filename: str, ctx: Context = None) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     path.unlink()
-    evt = {"type": "tool", "tool": "delete_memory", "file": filename}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {"type": "tool", "tool": "delete_memory", "file": filename, "from": cf.get("device", cf.get("client", "")[:8] if cf.get("client") else "")}
+    evt.update(cf)
     emit_monitor_event(evt)
     return f"Deleted {filename}."
 
@@ -287,6 +300,7 @@ def monitor_unsubscribe(q: asyncio.Queue):
 
 
 def emit_monitor_event(event: dict):
+    event["id"] = _next_event_id()
     event.setdefault("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     dead = []
     for q in _monitor_queues:
@@ -320,8 +334,37 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
 
     queues = _agent_queues.get(agent_id, set())
     online = bool(queues)
-    evt = {"type": "notify", "agent": agent_id, "task": task_id, "online": online}
-    evt.update(_client_fields(ctx))
+    cf = _client_fields(ctx)
+    evt = {
+        "type": "notify",
+        "task": task_id,
+        "from": cf.get("device", cf.get("client", "unknown")[:8] if cf.get("client") else "unknown"),
+        "to": agent_id,
+        "online": online,
+    }
+    # Include query preview from task file
+    task_path = DATA_DIR / task_id
+    if task_path.exists():
+        try:
+            content = task_path.read_text()
+            for line in content.splitlines():
+                header = line.strip().lower()
+                if header in ("## request", "## prompt"):
+                    idx = content.splitlines().index(line)
+                    request_lines = []
+                    for rline in content.splitlines()[idx + 1:]:
+                        if rline.startswith("## ") or rline.startswith("# "):
+                            break
+                        request_lines.append(rline)
+                    query = " ".join(request_lines).strip()
+                    if len(query) > 120:
+                        query = query[:117] + "..."
+                    if query:
+                        evt["query"] = query
+                    break
+        except Exception:
+            pass
+    evt.update(cf)
     emit_monitor_event(evt)
 
     if not queues:

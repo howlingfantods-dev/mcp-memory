@@ -93,20 +93,22 @@ def format_event(event: dict, use_color: bool) -> str:
         return f"{ts} {color}{label}{reset} {detail}"
 
     if etype == "tool":
+        eid = event.get("id", "")
         tool = event.get("tool", "").replace("_memory", "")
+        sender = event.get("from", "")
         f = event.get("file", "")
         b = event.get("bytes")
-        parts = [f"{ts} {color}{label}{reset} {tool.ljust(14)} {f}"]
+        id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
+        from_tag = f"{BOLD}@{sender}{RESET} " if use_color and sender else f"@{sender} " if sender else ""
+        parts = [f"{ts} {id_tag}{color}{label}{reset} {from_tag}{tool.ljust(14)} {f}"]
         if b is not None:
             parts.append(format_bytes(b))
-        # Show query params
         prefix = event.get("prefix")
         if prefix:
             parts.append(f"prefix={prefix}")
         query = event.get("query")
         if query:
             parts.append(f"q=\"{query}\"")
-        parts.append(caller.lstrip())
         return "  ".join(p for p in parts if p)
 
     if etype == "notify":
@@ -116,10 +118,12 @@ def format_event(event: dict, use_color: bool) -> str:
         return f"{ts} {color}{label}{reset} {agent.ljust(14)} {task}  {online}{caller}"
 
     if etype == "task":
+        eid = event.get("id", "")
         task = event.get("task", "")
         status = event.get("status", "")
         agent = event.get("agent", "")
-        parts = [f"{ts} {color}{label}{reset} {task.ljust(28)} {status.ljust(12)} {agent}"]
+        id_tag = f"{DIM}#{eid}{RESET} " if use_color and eid else f"#{eid} " if eid else ""
+        parts = [f"{ts} {id_tag}{color}{label}{reset} {task.ljust(28)} {status.ljust(12)} @{agent}"]
         if event.get("tokens_in") is not None:
             parts.append(format_tokens(event["tokens_in"], event["tokens_out"]))
         if event.get("cost_usd") is not None:
