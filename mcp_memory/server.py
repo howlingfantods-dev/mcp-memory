@@ -87,6 +87,51 @@ def _parse_md_section(content: str, headers: set[str]) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_task_content(content: str) -> str | None:
+    """Normalize markdown task content to JSON. Returns JSON string or None if already JSON."""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            return None  # already JSON
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    task = {
+        "title": _parse_md_field(content, "title") or "",
+        "status": _parse_md_field(content, "status") or "pending",
+        "type": _parse_md_field(content, "type") or "query",
+        "created": _parse_md_field(content, "created") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_by": _parse_md_field(content, "created_by") or "user",
+        "target": _parse_md_field(content, "target") or "",
+        "timeout": int(_parse_md_field(content, "timeout") or "120"),
+        "request": _parse_md_section(content, _REQUEST_HEADERS) or "",
+        "allowed_commands": [],
+        "files": [],
+        "result": None,
+        "log": [{"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "agent": "server", "msg": "Normalized from markdown"}],
+    }
+
+    # Parse allowed_commands from ## Allowed Commands section
+    in_cmds = False
+    for line in content.splitlines():
+        if line.strip() == "## Allowed Commands":
+            in_cmds = True
+            continue
+        if in_cmds:
+            if line.startswith("## ") or line.startswith("# "):
+                break
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                task["allowed_commands"].append(stripped[2:])
+
+    # Parse files
+    raw_files = _parse_md_field(content, "files")
+    if raw_files:
+        task["files"] = [f.strip() for f in raw_files.split(",") if f.strip()]
+
+    return json.dumps(task, indent=2)
+
+
 def _validate_filename(filename: str) -> Path:
     if not FILENAME_RE.match(filename):
         raise ValueError(
@@ -216,6 +261,18 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
         filename: Name of the .md file to write (e.g. "MEMORY.md")
         content: Full markdown content to write
     """
+    # Normalize markdown tasks to JSON on write
+    if filename.startswith("task-"):
+        normalized = _normalize_task_content(content)
+        if normalized is not None:
+            content = normalized
+        if filename.endswith(".md"):
+            old_path = _validate_filename(filename)
+            filename = filename[:-3] + ".json"
+            # Clean up the .md file if it exists
+            if old_path.exists():
+                old_path.unlink()
+
     path = _validate_filename(filename)
     path.write_text(content)
     if filename.startswith("task-") and filename.endswith(".json"):
@@ -241,6 +298,56 @@ def _emit_task_event(filename: str, content: str):
         emit_monitor_event(evt)
     except (json.JSONDecodeError, Exception):
         pass
+
+
+@mcp.tool()
+async def create_task(target: str, request: str, task_type: str = "query",
+                      timeout: int = 120, allowed_commands: list[str] | None = None,
+                      files: list[str] | None = None, ctx: Context = None) -> str:
+    """Create a task, save it, and notify the target agent.
+
+    Primary dispatch interface — generates a UUID filename, builds the JSON task,
+    saves it, and sends an SSE notification to the target agent.
+
+    Args:
+        target: Agent ID to dispatch to (e.g. "arch", "power", "here" for broadcast)
+        request: What the agent should do
+        task_type: Task type — "query" (default) or "code-edit"
+        timeout: Max seconds for execution (default 120)
+        allowed_commands: Optional list of shell commands the agent may run
+        files: Optional list of file paths (required for code-edit tasks)
+    """
+    task_id = f"task-{uuid.uuid4()}.json"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    cf = _client_fields(ctx)
+    if cf.get("is_daemon"):
+        created_by = cf.get("device", "daemon")
+    else:
+        created_by = "user"
+
+    task = {
+        "title": request[:80],
+        "status": "pending",
+        "type": task_type,
+        "created": now,
+        "created_by": created_by,
+        "target": target,
+        "timeout": timeout,
+        "request": request,
+        "allowed_commands": allowed_commands or [],
+        "files": files or [],
+        "result": None,
+        "log": [{"ts": now, "agent": created_by, "msg": "Created task"}],
+    }
+
+    path = _validate_filename(task_id)
+    content = json.dumps(task, indent=2)
+    path.write_text(content)
+    _emit_task_event(task_id, content)
+
+    result = await notify_agent(target, task_id, ctx)
+    return task_id
 
 
 @mcp.tool()
@@ -309,6 +416,60 @@ def delete_memory(filename: str, ctx: Context = None) -> str:
 
 _agent_queues: dict[str, set[asyncio.Queue]] = {}
 
+# ── In-memory heartbeat + lock state ─────────────────────────────────
+
+_heartbeats: dict[str, datetime] = {}
+_locks: dict[str, dict] = {}  # filename -> {"agent_id": str, "acquired": datetime}
+
+HEARTBEAT_STALE_SECONDS = 600
+
+
+def update_heartbeat(agent_id: str):
+    _heartbeats[agent_id] = datetime.now(timezone.utc)
+
+
+def get_heartbeat(agent_id: str) -> datetime | None:
+    return _heartbeats.get(agent_id)
+
+
+def is_agent_alive(agent_id: str, stale_seconds: int = HEARTBEAT_STALE_SECONDS) -> bool:
+    if agent_id not in _agent_queues:
+        return False
+    ts = _heartbeats.get(agent_id)
+    if ts is None:
+        return True  # connected via SSE but no heartbeat yet — assume alive
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age < stale_seconds
+
+
+def acquire_lock(agent_id: str, filename: str) -> dict:
+    existing = _locks.get(filename)
+    if existing:
+        if existing["agent_id"] == agent_id:
+            return {"ok": True, "msg": "already held"}
+        if is_agent_alive(existing["agent_id"]):
+            return {"ok": False, "msg": f"locked by {existing['agent_id']}"}
+        logger.info("Breaking stale lock on %s (held by %s)", filename, existing["agent_id"])
+    _locks[filename] = {"agent_id": agent_id, "acquired": datetime.now(timezone.utc)}
+    return {"ok": True, "msg": "acquired"}
+
+
+def release_lock(agent_id: str, filename: str) -> dict:
+    existing = _locks.get(filename)
+    if not existing:
+        return {"ok": True, "msg": "not locked"}
+    if existing["agent_id"] != agent_id:
+        return {"ok": False, "msg": f"locked by {existing['agent_id']}"}
+    del _locks[filename]
+    return {"ok": True, "msg": "released"}
+
+
+def release_all_locks(agent_id: str) -> int:
+    to_delete = [f for f, v in _locks.items() if v["agent_id"] == agent_id]
+    for f in to_delete:
+        del _locks[f]
+    return len(to_delete)
+
 
 def agent_subscribe(agent_id: str) -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue()
@@ -360,6 +521,16 @@ def emit_monitor_event(event: dict):
 @mcp.tool()
 def _set_task_target(content: str, agent_id: str) -> str:
     """Set or replace the target field in a task file."""
+    # Try JSON first
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            data["target"] = agent_id
+            return json.dumps(data, indent=2)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Markdown fallback (for normalization layer)
     lines = content.splitlines()
     new_lines = []
     found = False
@@ -370,7 +541,6 @@ def _set_task_target(content: str, agent_id: str) -> str:
             found = True
         elif clean.lower() == "## target":
             new_lines.append(line)
-            # Replace the next line (the value) — handled below
             found = "header"
         elif found == "header":
             new_lines.append(agent_id)
@@ -378,7 +548,6 @@ def _set_task_target(content: str, agent_id: str) -> str:
         else:
             new_lines.append(line)
     if not found:
-        # Insert before request section
         final = []
         inserted = False
         for line in new_lines:
@@ -418,8 +587,14 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         template = task_path.read_text()
         results = []
         for aid in connected:
-            agent_task_id = task_id.replace(".md", f"-{aid}.md").replace(".json", f"-{aid}.json")
-            agent_content = _set_task_target(template, aid)
+            agent_task_id = f"task-{uuid.uuid4()}.json"
+            # Set target via JSON dict or markdown fallback
+            try:
+                data = json.loads(template)
+                data["target"] = aid
+                agent_content = json.dumps(data, indent=2)
+            except (json.JSONDecodeError, ValueError):
+                agent_content = _set_task_target(template, aid)
             agent_path = DATA_DIR / agent_task_id
             agent_path.write_text(agent_content)
             result = await notify_agent(aid, agent_task_id, ctx)
@@ -428,13 +603,15 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         task_path.unlink()
         return f"Broadcast to {len(connected)} agents:\n" + "\n".join(results)
 
-    reg_filename = f"agent-reg-{agent_id}.md"
-    reg_path = DATA_DIR / reg_filename
-    if not reg_path.exists():
-        raise FileNotFoundError(
-            f"Agent registry '{reg_filename}' not found. "
-            f"Is agent '{agent_id}' registered?"
-        )
+    # Verify agent is known (has heartbeat or SSE connection)
+    if agent_id not in _heartbeats and agent_id not in _agent_queues:
+        # Check legacy reg file as fallback during migration
+        reg_path = DATA_DIR / f"agent-reg-{agent_id}.md"
+        if not reg_path.exists():
+            raise FileNotFoundError(
+                f"Agent '{agent_id}' is not registered. "
+                f"No heartbeat or SSE connection found."
+            )
 
     queues = _agent_queues.get(agent_id, set())
     online = bool(queues)
@@ -448,33 +625,21 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     if task_path.exists():
         try:
             content = task_path.read_text()
-            data = None
-            try:
-                data = json.loads(content)
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-            if data is not None:
-                status = data.get("status", "pending")
-            else:
-                status = _parse_md_field(content, "status") or "pending"
+            data = json.loads(content)
+            status = data.get("status", "pending")
             if status in ("completed", "failed"):
                 action = "response"
 
-            # Extract errors from Result section on failure
             if status == "failed":
-                raw = _parse_md_section(content, {"## result"})
-                if raw.startswith("_(") and raw.endswith(")_"):
+                raw = data.get("result", "")
+                if isinstance(raw, str) and raw.startswith("_(") and raw.endswith(")_"):
                     raw = raw[2:-2]
                 if raw:
-                    errors = [e.strip() for e in raw.split(";") if e.strip()]
+                    errors = [e.strip() for e in str(raw).split(";") if e.strip()]
                 else:
                     errors = []
 
-            if data is not None:
-                query = data.get("request", "") or data.get("prompt", "")
-            else:
-                query = _parse_md_section(content, _REQUEST_HEADERS)
+            query = data.get("request", "") or data.get("prompt", "")
             if len(query) > 120:
                 query = query[:117] + "..."
         except Exception:
@@ -563,10 +728,8 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
     return f"Registered client {cid[:8]}... as '{name}'."
 
 
-def _extract_result(data: dict | None, content: str) -> str:
-    if data is not None:
-        return data.get("result", "")
-    return _parse_md_section(content, {"## result"})
+def _extract_result(data: dict) -> str:
+    return data.get("result", "") if data else ""
 
 
 @mcp.tool()
@@ -595,19 +758,15 @@ async def await_task(task_id: str, timeout: int = 120, ctx: Context = None) -> s
             continue
 
         content = path.read_text()
-        data = None
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, ValueError):
-            pass
+            data = {}
 
-        if data is not None:
-            last_status = data.get("status", "pending")
-        else:
-            last_status = _parse_md_field(content, "status") or "unknown"
+        last_status = data.get("status", "pending")
 
         if last_status in ("completed", "failed"):
-            result = _extract_result(data, content)
+            result = _extract_result(data)
             clear_thinking_buffer(task_id)
             if last_status == "failed":
                 return f"FAILED: {result}" if result else "FAILED: (no details)"

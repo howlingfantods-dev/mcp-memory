@@ -58,6 +58,7 @@ class MCPClient:
             "client_id": self._client_id,
             "session_id": self._session_id,
         }))
+        self._token_file.chmod(0o600)
 
     def _next_id(self) -> int:
         self._msg_id += 1
@@ -305,10 +306,12 @@ class MCPClient:
             raise RuntimeError(f"No result in response: {resp.text[:500]}")
 
         # MCP tool results are in result.content[0].text
+        is_error = result.get("isError", False)
         content = result.get("content", [])
-        if content and isinstance(content, list):
-            return content[0].get("text", "")
-        return str(result)
+        text = content[0].get("text", "") if content and isinstance(content, list) else str(result)
+        if is_error:
+            raise RuntimeError(f"MCP tool '{tool_name}' returned error: {text}")
+        return text
 
     # ── Convenience methods ──────────────────────────────────────────
 
@@ -329,6 +332,10 @@ class MCPClient:
 
     def delete(self, filename: str) -> str:
         return self._call_tool("delete_memory", {"filename": filename})
+
+    def create_task(self, target: str, request: str, **kwargs) -> str:
+        args = {"target": target, "request": request, **kwargs}
+        return self._call_tool("create_task", args)
 
     def notify_agent(self, agent_id: str, task_id: str) -> str:
         return self._call_tool("notify_agent", {"agent_id": agent_id, "task_id": task_id})

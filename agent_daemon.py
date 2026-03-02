@@ -22,7 +22,6 @@ Environment variables:
 import json
 import logging
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -52,9 +51,6 @@ MAX_TASK_DURATION = int(os.environ.get("MAX_TASK_DURATION", "300"))
 BLOCKED_PATHS = os.environ.get("BLOCKED_PATHS", "/etc,/boot,~/.ssh").split(",")
 REPO_DIR = os.environ.get("REPO_DIR", os.getcwd())
 SYNCTHING_SETTLE_SECONDS = int(os.environ.get("SYNCTHING_SETTLE", "5"))
-
-REG_FILENAME = f"agent-reg-{AGENT_ID}.md"
-
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -102,37 +98,6 @@ def detect_shell() -> str:
 
 # ── Agent Registration ───────────────────────────────────────────────
 
-def build_registration() -> str:
-    return f"""# Agent: {AGENT_ID}
-
-## Identity
-- hostname: {socket.gethostname()}
-- platform: {AGENT_PLATFORM}
-- registered: {now_iso()}
-
-## Status
-- connection: sse
-- status: online
-- last_seen: {now_iso()}
-
-## Capabilities
-- shell: {detect_shell()}
-- gpu: {detect_gpu()}
-- roles: {", ".join(AGENT_ROLES)}
-
-## Restrictions
-- max_task_duration: {MAX_TASK_DURATION}
-- blocked_paths: {", ".join(BLOCKED_PATHS)}
-"""
-
-
-def register_agent(mcp: MCPClient):
-    """Write or overwrite agent registration file."""
-    content = build_registration()
-    mcp.write(REG_FILENAME, content)
-    logger.info("Registered agent '%s'", AGENT_ID)
-
-
 def register_device_info(mcp: MCPClient):
     """Register this daemon's client_id → device name in the server lookup table."""
     try:
@@ -146,16 +111,12 @@ def register_device_info(mcp: MCPClient):
         logger.warning("Device registration failed: %s", e)
 
 
-def update_heartbeat(mcp: MCPClient):
-    """Update last_seen timestamp — direct HTTP, no LLM."""
+def update_heartbeat():
+    """POST heartbeat to server — single HTTP call, no MCP."""
     try:
-        content = mcp.read(REG_FILENAME)
-        for line in content.splitlines():
-            if line.strip().startswith("- last_seen:"):
-                mcp.edit(REG_FILENAME, line.strip(), f"- last_seen: {now_iso()}")
-                return
+        httpx.post(f"{MCP_URL}/heartbeat/{AGENT_ID}", timeout=5)
     except Exception as e:
-        logger.warning("Heartbeat update failed: %s", e)
+        logger.warning("Heartbeat failed: %s", e)
 
 
 # ── Task Handling ────────────────────────────────────────────────────
@@ -172,195 +133,79 @@ def _try_parse_json(content: str) -> dict | None:
 
 
 def parse_task_field(content: str, field: str) -> str:
-    """Extract a field value from task content (JSON or markdown)."""
-    # Try JSON first
+    """Extract a field value from task content (JSON only)."""
     data = _try_parse_json(content)
-    if data is not None:
-        val = data.get(field)
-        if val is None:
-            # Also check common aliases
-            aliases = {"assigned_to": "target", "target": "assigned_to"}
-            val = data.get(aliases.get(field, ""))
-        if val is None:
-            return ""
-        if isinstance(val, list):
-            return ", ".join(str(v) for v in val)
-        return str(val)
-
-    # Markdown fallback — strip inline decoration (*, _) before matching
-    lines = content.splitlines()
-    for i, line in enumerate(lines):
-        clean = line.strip().replace('*', '').replace('_', '')
-        # '- field: value'
-        if clean.startswith(f"- {field}:"):
-            return clean[len(f"- {field}:"):].strip()
-        # '## field' followed by value on next line
-        if clean.lower() == f"## {field}" and i + 1 < len(lines):
-            val = lines[i + 1].strip()
-            if val and not val.startswith("#"):
-                return val
-        # bare 'field: value'
-        if clean.startswith(f"{field}:") and not clean.startswith(f"- {field}:"):
-            return clean[len(f"{field}:"):].strip()
-    return ""
+    if data is None:
+        return ""
+    val = data.get(field)
+    if val is None:
+        aliases = {"assigned_to": "target", "target": "assigned_to"}
+        val = data.get(aliases.get(field, ""))
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val)
+    return str(val)
 
 
 def parse_allowed_commands(content: str) -> list[str]:
-    """Extract allowed commands from task content (JSON or markdown)."""
+    """Extract allowed commands from task content (JSON only)."""
     data = _try_parse_json(content)
-    if data is not None:
-        cmds = data.get("allowed_commands", [])
-        return cmds if isinstance(cmds, list) else []
-
-    commands = []
-    in_section = False
-    for line in content.splitlines():
-        if line.strip() == "## Allowed Commands":
-            in_section = True
-            continue
-        if in_section:
-            if line.startswith("## "):
-                break
-            stripped = line.strip()
-            if stripped.startswith("- "):
-                commands.append(stripped[2:])
-    return commands
+    if data is None:
+        return []
+    cmds = data.get("allowed_commands", [])
+    return cmds if isinstance(cmds, list) else []
 
 
 def parse_request(content: str) -> str:
-    """Extract the request text from task content (JSON or markdown)."""
+    """Extract the request text from task content (JSON only)."""
     data = _try_parse_json(content)
-    if data is not None:
-        return data.get("request", "") or data.get("prompt", "")
-
-    lines = []
-    in_section = False
-    for line in content.splitlines():
-        header = line.strip().replace('*', '').replace('_', '').lower()
-        if header in ("## request", "## prompt", "## instructions", "## instruction", "## description"):
-            in_section = True
-            continue
-        if in_section:
-            if line.startswith("## ") or line.startswith("# "):
-                break
-            lines.append(line)
-    return "\n".join(lines).strip()
+    if data is None:
+        return ""
+    return data.get("request", "") or data.get("prompt", "")
 
 
 def parse_files_list(content: str) -> list[str]:
-    """Extract the files list from task content (JSON or markdown)."""
+    """Extract the files list from task content (JSON only)."""
     data = _try_parse_json(content)
-    if data is not None:
-        files = data.get("files", [])
-        if isinstance(files, list):
-            return [f for f in files if f]
+    if data is None:
         return []
-
-    raw = parse_task_field(content, "files")
-    if not raw:
-        return []
-    return [f.strip() for f in raw.split(",") if f.strip()]
-
-
-def lock_filename(filepath: str) -> str:
-    """Convert a filepath to a lock filename: agent_daemon.py → lock-agent-daemon-py.md"""
-    filepath = os.path.expanduser(filepath)
-    safe = re.sub(r"[^a-zA-Z0-9\-]", "-", filepath).strip("-")
-    return f"lock-{safe}.md"
+    files = data.get("files", [])
+    if isinstance(files, list):
+        return [f for f in files if f]
+    return []
 
 
-# ── File Locking ─────────────────────────────────────────────────────
+# ── File Locking (server-side via HTTP) ───────────────────────────────
 
-def acquire_locks(mcp: MCPClient, files: list[str]) -> list[str]:
-    """Acquire MCP file locks for a list of files.
-
-    Uses write-then-verify to avoid TOCTOU races: writes the lock, reads it
-    back, and only proceeds if we're the holder. If another agent won the race,
-    releases all acquired locks and returns empty list.
-    """
+def acquire_locks(files: list[str]) -> list[str]:
+    """Acquire file locks via server HTTP endpoint."""
     acquired = []
     for filepath in files:
-        lf = lock_filename(filepath)
-
-        # Check for existing lock first
         try:
-            existing = mcp.read(lf)
-            # Lock exists — check if it's ours (re-entrant) or stale
-            if f"- holder: {AGENT_ID}" in existing:
-                acquired.append(filepath)
-                logger.info("Already hold lock: %s", filepath)
-                continue
-            if _is_stale_lock(mcp, existing):
-                logger.info("Breaking stale lock on %s", filepath)
-                mcp.delete(lf)
-            else:
-                logger.warning("File '%s' is locked by another agent", filepath)
-                release_locks(mcp, acquired)
+            resp = httpx.post(f"{MCP_URL}/lock/{AGENT_ID}/{filepath}", timeout=10)
+            result = resp.json()
+            if not result.get("ok"):
+                logger.warning("Lock denied for %s: %s", filepath, result.get("msg"))
+                release_locks(acquired)
                 return []
-        except Exception:
-            pass  # FileNotFoundError = not locked, proceed
-
-        # Write our lock
-        lock_content = (
-            f"- holder: {AGENT_ID}\n"
-            f"- acquired: {now_iso()}\n"
-            f"- file: {filepath}\n"
-        )
-        mcp.write(lf, lock_content)
-
-        # Verify we won the race — read it back
-        try:
-            readback = mcp.read(lf)
-            if f"- holder: {AGENT_ID}" not in readback:
-                logger.warning("Lost lock race on %s", filepath)
-                release_locks(mcp, acquired)
-                return []
-        except Exception:
-            logger.warning("Failed to verify lock on %s", filepath)
-            release_locks(mcp, acquired)
+            acquired.append(filepath)
+            logger.info("Acquired lock: %s", filepath)
+        except Exception as e:
+            logger.error("Lock request failed for %s: %s", filepath, e)
+            release_locks(acquired)
             return []
-
-        acquired.append(filepath)
-        logger.info("Acquired lock: %s", filepath)
-
     return acquired
 
 
-def release_locks(mcp: MCPClient, files: list[str]):
-    """Release MCP file locks."""
+def release_locks(files: list[str]):
+    """Release file locks via server HTTP endpoint."""
     for filepath in files:
-        lf = lock_filename(filepath)
         try:
-            mcp.delete(lf)
+            httpx.delete(f"{MCP_URL}/lock/{AGENT_ID}/{filepath}", timeout=5)
             logger.info("Released lock: %s", filepath)
         except Exception:
             pass
-
-
-def _is_stale_lock(mcp: MCPClient, lock_content: str) -> bool:
-    """Check if a lock is stale (holder offline >10 min)."""
-    holder = None
-    for line in lock_content.splitlines():
-        if line.strip().startswith("- holder:"):
-            holder = line.strip()[len("- holder:"):].strip()
-            break
-    if not holder:
-        return True
-    try:
-        reg = mcp.read(f"agent-reg-{holder}.md")
-        for line in reg.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("- status:") and "offline" in stripped:
-                return True
-            if stripped.startswith("- last_seen:"):
-                last_seen_str = stripped[len("- last_seen:"):].strip()
-                last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
-                age_min = (datetime.now(timezone.utc) - last_seen).total_seconds() / 60
-                if age_min > 10:
-                    return True
-    except Exception:
-        return True  # Can't read registry = assume stale
-    return False
 
 
 def git_commit_files(files: list[str], message: str) -> str:
@@ -398,103 +243,86 @@ def git_commit_files(files: list[str], message: str) -> str:
         return f"git error: {e}"
 
 
-def _md_find_field_line(content: str, field: str, value: str) -> str | None:
-    """Find the exact line containing 'field: value' in any markdown format."""
-    for line in content.splitlines():
-        clean = line.strip().replace('*', '').replace('_', '')
-        if clean in (f"- {field}: {value}", f"{field}: {value}"):
-            return line.rstrip()
-    # ## field\nvalue format
-    for i, line in enumerate(content.splitlines()):
-        if line.strip().replace('*', '').replace('_', '').lower() == f"## {field}":
-            lines = content.splitlines()
-            if i + 1 < len(lines) and lines[i + 1].strip() == value:
-                return f"{line.rstrip()}\n{lines[i + 1].rstrip()}"
+def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str, content: str | None = None):
+    """Update task status (JSON only)."""
+    fresh = _try_parse_json(mcp.read(task_id))
+    if fresh is None:
+        logger.warning("Cannot parse task %s as JSON", task_id)
+        return
+    fresh["status"] = new_status
+    mcp.write(task_id, json.dumps(fresh, indent=2))
+
+
+def _edit_result(mcp: MCPClient, task_id: str, result_text: str, content: str | None = None):
+    """Write result text (JSON only)."""
+    fresh = _try_parse_json(mcp.read(task_id))
+    if fresh is None:
+        logger.warning("Cannot parse task %s as JSON", task_id)
+        return
+    fresh["result"] = result_text
+    mcp.write(task_id, json.dumps(fresh, indent=2))
+
+
+def append_log(mcp: MCPClient, task_id: str, agent: str, message: str, content: str | None = None):
+    """Append a log entry to the task file (JSON only)."""
+    fresh = _try_parse_json(mcp.read(task_id))
+    if fresh is None:
+        logger.warning("Cannot parse task %s as JSON", task_id)
+        return
+    if "log" not in fresh or not isinstance(fresh["log"], list):
+        fresh["log"] = []
+    fresh["log"].append({"ts": now_iso(), "agent": agent, "msg": message})
+    mcp.write(task_id, json.dumps(fresh, indent=2))
+
+
+def _set_running(mcp: MCPClient, task_id: str, data: dict | None = None) -> dict | None:
+    """Transition task from claimed to running (single write for JSON)."""
+    if data is not None:
+        data["status"] = "running"
+        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": "Executing task"})
+        mcp.write(task_id, json.dumps(data, indent=2))
+        return data
+    content = mcp.read(task_id)
+    _edit_status(mcp, task_id, "claimed", "running", content=content)
+    append_log(mcp, task_id, AGENT_ID, "Executing task")
     return None
 
 
-def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str):
-    """Update task status (JSON or markdown)."""
-    content = mcp.read(task_id)
-    data = _try_parse_json(content)
-    if data is not None:
-        data["status"] = new_status
-        mcp.write(task_id, json.dumps(data, indent=2))
-        return
-    old_line = _md_find_field_line(content, "status", old_status)
-    if old_line:
-        mcp.edit(task_id, old_line, old_line.replace(old_status, new_status, 1))
-    else:
-        logger.warning("Could not find 'status: %s' in %s", old_status, task_id)
-
-
-def _edit_result(mcp: MCPClient, task_id: str, result_text: str):
-    """Write result text (JSON or markdown)."""
-    content = mcp.read(task_id)
-    data = _try_parse_json(content)
+def _complete_task(mcp: MCPClient, task_id: str, result_text: str, log_msg: str, data: dict | None = None) -> dict | None:
+    """Set result + status=completed + log entry (single write for JSON)."""
     if data is not None:
         data["result"] = result_text
+        data["status"] = "completed"
+        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": log_msg})
         mcp.write(task_id, json.dumps(data, indent=2))
-        return
-    if "_(pending)_" in content:
-        mcp.edit(task_id, "_(pending)_", result_text)
-    elif "## Result\n" in content:
-        old_section = content.split("## Result\n", 1)[1].split("\n## ", 1)[0]
-        mcp.edit(task_id, f"## Result\n{old_section}", f"## Result\n{result_text}\n")
-    elif "## result\n" in content:
-        old_section = content.split("## result\n", 1)[1].split("\n## ", 1)[0]
-        mcp.edit(task_id, f"## result\n{old_section}", f"## result\n{result_text}\n")
-    else:
-        if "## status" in content:
-            mcp.edit(task_id, "## status", f"## result\n{result_text}\n\n## status")
-        elif "## Meta" in content:
-            mcp.edit(task_id, "## Log", f"## Result\n{result_text}\n\n## Log")
-        else:
-            mcp.write(task_id, content + f"\n\n## Result\n{result_text}\n")
-
-
-def append_log(mcp: MCPClient, task_id: str, agent: str, message: str):
-    """Append a log entry to the task file (JSON or markdown)."""
+        return data
     content = mcp.read(task_id)
-    data = _try_parse_json(content)
-    if data is not None:
-        if "log" not in data or not isinstance(data["log"], list):
-            data["log"] = []
-        data["log"].append({"ts": now_iso(), "agent": agent, "msg": message})
-        mcp.write(task_id, json.dumps(data, indent=2))
-        return
-    log_entry = f"\n- {now_iso()} [{agent}] {message}"
-    if "## Log" in content:
-        mcp.edit(task_id, "## Log", f"## Log{log_entry}")
-    else:
-        mcp.write(task_id, content + f"\n\n## Log{log_entry}")
+    _edit_result(mcp, task_id, result_text, content=content)
+    _edit_status(mcp, task_id, "running", "completed", content=content)
+    append_log(mcp, task_id, AGENT_ID, log_msg)
+    return None
 
 
-def claim_task(mcp: MCPClient, task_id: str) -> bool:
-    """Attempt to claim a task via optimistic locking."""
+def claim_task(mcp: MCPClient, task_id: str, content: str | None = None) -> dict | bool:
+    """Attempt to claim a task. Returns data dict on success, False on failure."""
     try:
-        content = mcp.read(task_id)
+        if content is None:
+            content = mcp.read(task_id)
     except Exception as e:
         logger.info("Could not read task %s: %s", task_id, e)
         return False
     try:
         data = _try_parse_json(content)
-        if data is not None:
-            if data.get("status", "pending") != "pending":
-                logger.info("Could not find pending status in task %s", task_id)
-                return False
-            data["status"] = "claimed"
-            mcp.write(task_id, json.dumps(data, indent=2))
-        else:
-            old_line = _md_find_field_line(content, "status", "pending")
-            if old_line:
-                mcp.edit(task_id, old_line, old_line.replace("pending", "claimed", 1))
-            else:
-                # No status field at all — insert one via append
-                mcp.write(task_id, content.rstrip() + "\nstatus: claimed\n")
-                logger.info("Inserted missing status field as 'claimed' in %s", task_id)
-        append_log(mcp, task_id, AGENT_ID, "Claimed task")
-        return True
+        if data is None:
+            logger.info("Task %s is not valid JSON", task_id)
+            return False
+        if data.get("status", "pending") != "pending":
+            logger.info("Could not find pending status in task %s", task_id)
+            return False
+        data["status"] = "claimed"
+        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": "Claimed task"})
+        mcp.write(task_id, json.dumps(data, indent=2))
+        return data
     except Exception as e:
         logger.info("Could not claim task %s: %s", task_id, e)
         return False
@@ -524,14 +352,15 @@ def execute_task(mcp: MCPClient, task_id: str):
         logger.info("Task %s status is '%s', not 'pending'. Skipping.", task_id, status)
         return
 
-    # Claim
-    if not claim_task(mcp, task_id):
+    # Claim — returns data dict on success, False on failure
+    claim_result = claim_task(mcp, task_id, content=content)
+    if not claim_result:
         return
+    task_data = claim_result
 
     # Set running
     try:
-        _edit_status(mcp, task_id, "claimed", "running")
-        append_log(mcp, task_id, AGENT_ID, "Executing task")
+        task_data = _set_running(mcp, task_id, data=task_data)
     except Exception as e:
         logger.error("Failed to set running status: %s", e)
         return
@@ -542,37 +371,19 @@ def execute_task(mcp: MCPClient, task_id: str):
     timeout = int(parse_task_field(content, "timeout") or MAX_TASK_DURATION)
     task_type = parse_task_field(content, "type") or "query"
     files = parse_files_list(content)
-    raw_depth = parse_task_field(content, "depth")
-    created_by = parse_task_field(content, "created_by")
 
-    # Only user-originated tasks can start at depth 0.
-    # Agent-originated tasks must carry a depth field from their parent.
-    # If an agent tries to create a task without depth, refuse it.
-    if created_by and created_by != "howlingfantods_" and not raw_depth:
-        _fail_task(mcp, task_id, "Agent-originated tasks must include a depth field. Only user requests can start new chains.")
-        _notify_creator(mcp, task_id, content)
-        return
-
-    depth = int(raw_depth) if raw_depth else 0
-
-    MAX_DEPTH = 5
-    if depth >= MAX_DEPTH:
-        _fail_task(mcp, task_id, f"Max dispatch depth ({MAX_DEPTH}) exceeded. Refusing to sub-dispatch further.")
-        _notify_creator(mcp, task_id, content)
-        return
-
-    if task_type == "code-edit":
-        _execute_code_edit(mcp, task_id, request, files, allowed_commands, timeout, content, depth)
+    if task_type.lower() == "code-edit":
+        _execute_code_edit(mcp, task_id, request, files, allowed_commands, timeout, content, task_data)
     else:
-        _execute_query(mcp, task_id, request, allowed_commands, timeout, content, depth)
+        _execute_query(mcp, task_id, request, allowed_commands, timeout, content, task_data)
 
 
 def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
     """Build system prompt constraints for claude --print."""
     constraints = [
         f"You are executing a task on machine '{AGENT_ID}' ({AGENT_PLATFORM}).",
+        "Do NOT create or dispatch tasks to other agents. If you need information from another node, say so in your response and let the user decide.",
     ]
-    # depth is passed via closure from execute_task
 
     if request_type == "code-edit":
         constraints.append("Edit the requested files. Do NOT commit — the daemon handles git.")
@@ -692,47 +503,43 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
 
 def _execute_query(mcp: MCPClient, task_id: str, request: str,
                    allowed_commands: list[str], timeout: int, content: str,
-                   depth: int = 0):
+                   task_data: dict | None = None):
     """Execute a query task (check something, report output)."""
     system_prompt = _build_system_prompt("query", allowed_commands)
-    system_prompt += f"\nThis task is at dispatch depth {depth}/5. If you sub-dispatch to another agent, you MUST set depth to {depth + 1} in the task. Tasks without a depth field from agents will be rejected."
 
     logger.info("Invoking claude --print for query task %s", task_id)
     try:
         output, success = _invoke_claude(request, system_prompt, timeout, task_id=task_id)
 
-        _edit_result(mcp, task_id, output or "_(no output)_")
-        _edit_status(mcp, task_id, "running", "completed")
-        append_log(mcp, task_id, AGENT_ID, "Task completed")
+        _complete_task(mcp, task_id, output or "_(no output)_", "Task completed", data=task_data)
         logger.info("Task %s completed", task_id)
 
     except subprocess.TimeoutExpired:
-        _edit_status(mcp, task_id, "running", "failed")
-        _edit_result(mcp, task_id, f"_(timed out after {timeout}s)_")
-        append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
+        _fail_task(mcp, task_id, f"Timed out after {timeout}s", data=task_data)
         logger.warning("Task %s timed out", task_id)
 
     except Exception as e:
-        _fail_task(mcp, task_id, str(e))
+        _fail_task(mcp, task_id, str(e), data=task_data)
 
     _notify_creator(mcp, task_id, content)
 
 
 def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
                        files: list[str], allowed_commands: list[str],
-                       timeout: int, content: str, depth: int = 0):
+                       timeout: int, content: str,
+                       task_data: dict | None = None):
     """Execute a code-edit task: lock → edit → git commit → unlock."""
     if not files:
-        _fail_task(mcp, task_id, "code-edit task requires '- files:' field listing files to edit")
+        _fail_task(mcp, task_id, "code-edit task requires '- files:' field listing files to edit", data=task_data)
         _notify_creator(mcp, task_id, content)
         return
 
     # 1. Acquire file locks
     logger.info("Acquiring locks for %s", files)
     append_log(mcp, task_id, AGENT_ID, f"Acquiring locks: {', '.join(files)}")
-    locked = acquire_locks(mcp, files)
+    locked = acquire_locks(files)
     if not locked:
-        _fail_task(mcp, task_id, f"Could not acquire locks for: {', '.join(files)}. Another agent is editing.")
+        _fail_task(mcp, task_id, f"Could not acquire locks for: {', '.join(files)}. Another agent is editing.", data=task_data)
         _notify_creator(mcp, task_id, content)
         return
 
@@ -750,9 +557,7 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
         try:
             output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools, task_id=task_id)
         except subprocess.TimeoutExpired:
-            _edit_status(mcp, task_id, "running", "failed")
-            _edit_result(mcp, task_id, f"_(timed out after {timeout}s)_")
-            append_log(mcp, task_id, AGENT_ID, f"Task timed out after {timeout}s")
+            _fail_task(mcp, task_id, f"Timed out after {timeout}s", data=task_data)
             return
 
         # 4. Git commit the changed files
@@ -763,36 +568,37 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
         # 5. Write result
         result_text = output or "_(no output)_"
         result_text += f"\n\n**Git:** {git_result}"
-        _edit_result(mcp, task_id, result_text)
-        _edit_status(mcp, task_id, "running", "completed")
-        append_log(mcp, task_id, AGENT_ID, f"Task completed. {git_result}")
+        _complete_task(mcp, task_id, result_text, f"Task completed. {git_result}", data=task_data)
         logger.info("Code-edit task %s completed", task_id)
 
     except Exception as e:
-        _fail_task(mcp, task_id, str(e))
+        _fail_task(mcp, task_id, str(e), data=task_data)
 
     finally:
         # 6. Always release locks
-        release_locks(mcp, locked)
+        release_locks(locked)
 
     _notify_creator(mcp, task_id, content)
 
 
-def _fail_task(mcp: MCPClient, task_id: str, error: str):
+def _fail_task(mcp: MCPClient, task_id: str, error: str, data: dict | None = None):
     """Mark a task as failed."""
     try:
-        _edit_status(mcp, task_id, "running", "failed")
-        _edit_result(mcp, task_id, f"_(error: {error})_")
-        append_log(mcp, task_id, AGENT_ID, f"Task failed: {error}")
-    except Exception:
-        pass
+        if data is None:
+            data = _try_parse_json(mcp.read(task_id)) or {}
+        data["status"] = "failed"
+        data["result"] = f"_(error: {error})_"
+        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": f"Task failed: {error}"})
+        mcp.write(task_id, json.dumps(data, indent=2))
+    except Exception as e:
+        logger.error("Failed to update task %s during failure handling: %s", task_id, e)
     logger.error("Task %s failed: %s", task_id, error)
 
 
 def _notify_creator(mcp: MCPClient, task_id: str, content: str):
     """Best-effort notification to the task creator."""
     data = _try_parse_json(content)
-    created_by = data.get("created_by", "") if data else parse_task_field(content, "created_by")
+    created_by = data.get("created_by", "") if data else ""
     if created_by and created_by != AGENT_ID:
         try:
             mcp.notify_agent(created_by, task_id)
@@ -861,10 +667,10 @@ def sse_listen(mcp: MCPClient, sse_url: str):
 # ── Heartbeat ────────────────────────────────────────────────────────
 
 def heartbeat_loop(mcp: MCPClient, interval: int):
-    """Background thread that updates last_seen and cleans up old tasks."""
+    """Background thread that updates heartbeat and cleans up old tasks."""
     while True:
         time.sleep(interval)
-        update_heartbeat(mcp)
+        update_heartbeat()
         cleanup_old_tasks(mcp)
         logger.debug("Heartbeat sent")
 
@@ -981,9 +787,9 @@ def check_self_update() -> bool:
 def main():
     mcp = MCPClient(MCP_URL, token_name=AGENT_ID)
 
-    # Register
-    register_agent(mcp)
+    # Register device info and send initial heartbeat
     register_device_info(mcp)
+    update_heartbeat()
 
     # Pick up any tasks that arrived while we were offline
     check_pending_tasks(mcp)
@@ -996,13 +802,9 @@ def main():
     )
     heartbeat_thread.start()
 
-    # Graceful shutdown
+    # Graceful shutdown — server detects offline via SSE disconnect + stale heartbeat
     def shutdown(signum, frame):
         logger.info("Shutting down...")
-        try:
-            mcp.edit(REG_FILENAME, "- status: online", "- status: offline")
-        except Exception:
-            pass
         mcp.close()
         sys.exit(0)
 
