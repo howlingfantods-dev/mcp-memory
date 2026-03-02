@@ -186,21 +186,21 @@ def parse_task_field(content: str, field: str) -> str:
             return ", ".join(str(v) for v in val)
         return str(val)
 
-    # Markdown fallback
+    # Markdown fallback — strip inline decoration (*, _) before matching
     lines = content.splitlines()
     for i, line in enumerate(lines):
-        stripped = line.strip()
-        # Format 1: '- field: value'
-        if stripped.startswith(f"- {field}:"):
-            return stripped[len(f"- {field}:"):].strip()
-        # Format 2: '## field' followed by value on next line
-        if stripped.lower() == f"## {field}" and i + 1 < len(lines):
+        clean = line.strip().replace('*', '').replace('_', '')
+        # '- field: value'
+        if clean.startswith(f"- {field}:"):
+            return clean[len(f"- {field}:"):].strip()
+        # '## field' followed by value on next line
+        if clean.lower() == f"## {field}" and i + 1 < len(lines):
             val = lines[i + 1].strip()
             if val and not val.startswith("#"):
                 return val
-        # Format 3: bare 'field: value' (frontmatter style)
-        if stripped.startswith(f"{field}:") and not stripped.startswith("- "):
-            return stripped[len(f"{field}:"):].strip()
+        # bare 'field: value'
+        if clean.startswith(f"{field}:") and not clean.startswith(f"- {field}:"):
+            return clean[len(f"{field}:"):].strip()
     return ""
 
 
@@ -235,8 +235,8 @@ def parse_request(content: str) -> str:
     lines = []
     in_section = False
     for line in content.splitlines():
-        header = line.strip().lower()
-        if header in ("## request", "## prompt"):
+        header = line.strip().replace('*', '').replace('_', '').lower()
+        if header in ("## request", "## prompt", "## instructions"):
             in_section = True
             continue
         if in_section:
@@ -396,6 +396,21 @@ def git_commit_files(files: list[str], message: str) -> str:
         return f"git error: {e}"
 
 
+def _md_find_field_line(content: str, field: str, value: str) -> str | None:
+    """Find the exact line containing 'field: value' in any markdown format."""
+    for line in content.splitlines():
+        clean = line.strip().replace('*', '').replace('_', '')
+        if clean in (f"- {field}: {value}", f"{field}: {value}"):
+            return line.rstrip()
+    # ## field\nvalue format
+    for i, line in enumerate(content.splitlines()):
+        if line.strip().replace('*', '').replace('_', '').lower() == f"## {field}":
+            lines = content.splitlines()
+            if i + 1 < len(lines) and lines[i + 1].strip() == value:
+                return f"{line.rstrip()}\n{lines[i + 1].rstrip()}"
+    return None
+
+
 def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str):
     """Update task status (JSON or markdown)."""
     content = mcp.read(task_id)
@@ -404,14 +419,11 @@ def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str)
         data["status"] = new_status
         mcp.write(task_id, json.dumps(data, indent=2))
         return
-    if f"- status: {old_status}" in content:
-        mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
-    elif f"## status\n{old_status}" in content:
-        mcp.edit(task_id, f"## status\n{old_status}", f"## status\n{new_status}")
-    elif f"\nstatus: {old_status}" in content:
-        mcp.edit(task_id, f"status: {old_status}", f"status: {new_status}")
+    old_line = _md_find_field_line(content, "status", old_status)
+    if old_line:
+        mcp.edit(task_id, old_line, old_line.replace(old_status, new_status, 1))
     else:
-        mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
+        logger.warning("Could not find 'status: %s' in %s", old_status, task_id)
 
 
 def _edit_result(mcp: MCPClient, task_id: str, result_text: str):
@@ -471,18 +483,14 @@ def claim_task(mcp: MCPClient, task_id: str) -> bool:
                 return False
             data["status"] = "claimed"
             mcp.write(task_id, json.dumps(data, indent=2))
-        elif "- status: pending" in content:
-            mcp.edit(task_id, "- status: pending", "- status: claimed")
-        elif "\n## status\npending" in content:
-            mcp.edit(task_id, "## status\npending", "## status\nclaimed")
-        elif "\n## status\n pending" in content:
-            mcp.edit(task_id, "## status\n pending", "## status\nclaimed")
-        elif "\nstatus: pending" in content:
-            mcp.edit(task_id, "status: pending", "status: claimed")
         else:
-            # No status field at all — insert one via append
-            mcp.write(task_id, content.rstrip() + "\nstatus: claimed\n")
-            logger.info("Inserted missing status field as 'claimed' in %s", task_id)
+            old_line = _md_find_field_line(content, "status", "pending")
+            if old_line:
+                mcp.edit(task_id, old_line, old_line.replace("pending", "claimed", 1))
+            else:
+                # No status field at all — insert one via append
+                mcp.write(task_id, content.rstrip() + "\nstatus: claimed\n")
+                logger.info("Inserted missing status field as 'claimed' in %s", task_id)
         append_log(mcp, task_id, AGENT_ID, "Claimed task")
         return True
     except Exception as e:
