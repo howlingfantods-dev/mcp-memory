@@ -6,7 +6,7 @@ This repo runs agent daemons on multiple machines, coordinated through the MCP m
 
 | Alias | Agent ID | Platform | Notes |
 |-------|----------|----------|-------|
-| @thinkpad | thinkpad | Arch Linux | X1 Carbon, primary dev laptop |
+| @arch | arch | Arch Linux | ThinkPad X1 Carbon, primary dev laptop |
 | @power | power | Windows 11 | Legion desktop, RTX GPU, PowerShell |
 | @wsl | wsl | WSL2 (Ubuntu) | Legion desktop, Linux environment |
 | @mac | mac | macOS | MacBook |
@@ -37,11 +37,11 @@ Do NOT dispatch when:
 - The user already provided the info
 - The question is about code/files synced across all nodes (just read locally)
 
-Agents can also chain tasks — `@thinkpad` can dispatch to `@vps`, which dispatches to `@power`, with results flowing back through the response events.
+Agents can also chain tasks — `@arch` can dispatch to `@vps`, which dispatches to `@power`, with results flowing back through the response events.
 
 ## @ Dispatch Convention
 
-When the user mentions `@agent_id` in a message (e.g. "@thinkpad check the logs", "@power what's GPU usage"), or when you determine another node can answer better, dispatch a task to that machine:
+When the user mentions `@agent_id` in a message (e.g. "@arch check the logs", "@power what's GPU usage"), or when you determine another node can answer better, dispatch a task to that machine:
 
 1. **Create the task file** with `write_memory`:
    - Filename: `task-YYYYMMDD-HHMM-{short-desc}.json`
