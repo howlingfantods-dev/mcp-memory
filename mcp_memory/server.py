@@ -52,6 +52,44 @@ def _next_event_id() -> int:
     return _event_id
 
 
+_REQUEST_HEADERS = {"## request", "## prompt", "## instructions", "## instruction", "## description"}
+
+
+def _parse_md_field(content: str, field: str) -> str:
+    """Extract a field value from markdown task content, tolerant of formatting.
+
+    Handles: '- field: val', '**field:** val', '## field\\nval', 'field: val'.
+    """
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        clean = line.strip().replace('*', '').replace('_', '')
+        if clean.startswith(f"- {field}:"):
+            return clean[len(f"- {field}:"):].strip()
+        if clean.lower() == f"## {field}" and i + 1 < len(lines):
+            val = lines[i + 1].strip()
+            if val and not val.startswith("#"):
+                return val
+        if clean.startswith(f"{field}:") and not clean.startswith(f"- {field}:"):
+            return clean[len(f"{field}:"):].strip()
+    return ""
+
+
+def _parse_md_section(content: str, headers: set[str]) -> str:
+    """Extract body text under any matching ## header."""
+    lines = []
+    in_section = False
+    for line in content.splitlines():
+        header = line.strip().replace('*', '').replace('_', '').lower()
+        if header in headers:
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("## ") or line.startswith("# "):
+                break
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _validate_filename(filename: str) -> Path:
     if not FILENAME_RE.match(filename):
         raise ValueError(
@@ -329,18 +367,29 @@ def _set_task_target(content: str, agent_id: str) -> str:
     new_lines = []
     found = False
     for line in lines:
-        if line.strip().startswith("- target:"):
+        clean = line.strip().replace('*', '').replace('_', '')
+        if clean.startswith("- target:") or (clean.startswith("target:") and not clean.startswith("- target:")):
             new_lines.append(f"- target: {agent_id}")
+            found = True
+        elif clean.lower() == "## target":
+            new_lines.append(line)
+            # Replace the next line (the value) — handled below
+            found = "header"
+        elif found == "header":
+            new_lines.append(agent_id)
             found = True
         else:
             new_lines.append(line)
     if not found:
-        # Insert before ## Request
+        # Insert before request section
         final = []
+        inserted = False
         for line in new_lines:
-            if line.strip().lower() in ("## request", "## prompt"):
+            header = line.strip().replace('*', '').replace('_', '').lower()
+            if not inserted and header in _REQUEST_HEADERS:
                 final.append(f"- target: {agent_id}")
                 final.append("")
+                inserted = True
             final.append(line)
         new_lines = final
     return "\n".join(new_lines)
@@ -402,26 +451,22 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
     if task_path.exists():
         try:
             content = task_path.read_text()
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("- status:"):
-                    status = stripped[len("- status:"):].strip()
-                    if status in ("completed", "failed"):
-                        action = "response"
-                    break
+            data = None
+            try:
+                data = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            if data is not None:
+                status = data.get("status", "pending")
+            else:
+                status = _parse_md_field(content, "status") or "pending"
+            if status in ("completed", "failed"):
+                action = "response"
+
             # Extract errors from Result section on failure
             if status == "failed":
-                in_result = False
-                result_lines = []
-                for rline in content.splitlines():
-                    if rline.strip().lower() in ("## result",):
-                        in_result = True
-                        continue
-                    if in_result:
-                        if rline.startswith("## ") or rline.startswith("# "):
-                            break
-                        result_lines.append(rline)
-                raw = " ".join(result_lines).strip()
+                raw = _parse_md_section(content, {"## result"})
                 if raw.startswith("_(") and raw.endswith(")_"):
                     raw = raw[2:-2]
                 if raw:
@@ -429,19 +474,12 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
                 else:
                     errors = []
 
-            for line in content.splitlines():
-                header = line.strip().lower()
-                if header in ("## request", "## prompt"):
-                    idx = content.splitlines().index(line)
-                    request_lines = []
-                    for rline in content.splitlines()[idx + 1:]:
-                        if rline.startswith("## ") or rline.startswith("# "):
-                            break
-                        request_lines.append(rline)
-                    query = " ".join(request_lines).strip()
-                    if len(query) > 120:
-                        query = query[:117] + "..."
-                    break
+            if data is not None:
+                query = data.get("request", "") or data.get("prompt", "")
+            else:
+                query = _parse_md_section(content, _REQUEST_HEADERS)
+            if len(query) > 120:
+                query = query[:117] + "..."
         except Exception:
             pass
 
@@ -524,17 +562,7 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
 def _extract_result(data: dict | None, content: str) -> str:
     if data is not None:
         return data.get("result", "")
-    in_result = False
-    result_lines = []
-    for line in content.splitlines():
-        if line.strip().lower() in ("## result",):
-            in_result = True
-            continue
-        if in_result:
-            if line.startswith("## ") or line.startswith("# "):
-                break
-            result_lines.append(line)
-    return "\n".join(result_lines).strip()
+    return _parse_md_section(content, {"## result"})
 
 
 @mcp.tool()
@@ -572,11 +600,7 @@ async def await_task(task_id: str, timeout: int = 120, ctx: Context = None) -> s
         if data is not None:
             last_status = data.get("status", "pending")
         else:
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("- status:"):
-                    last_status = stripped[len("- status:"):].strip()
-                    break
+            last_status = _parse_md_field(content, "status") or "unknown"
 
         if last_status in ("completed", "failed"):
             result = _extract_result(data, content)

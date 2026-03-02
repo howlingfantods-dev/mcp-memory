@@ -236,7 +236,7 @@ def parse_request(content: str) -> str:
     in_section = False
     for line in content.splitlines():
         header = line.strip().replace('*', '').replace('_', '').lower()
-        if header in ("## request", "## prompt", "## instructions"):
+        if header in ("## request", "## prompt", "## instructions", "## instruction", "## description"):
             in_section = True
             continue
         if in_section:
