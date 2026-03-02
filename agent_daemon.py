@@ -190,12 +190,17 @@ def parse_task_field(content: str, field: str) -> str:
     lines = content.splitlines()
     for i, line in enumerate(lines):
         stripped = line.strip()
+        # Format 1: '- field: value'
         if stripped.startswith(f"- {field}:"):
             return stripped[len(f"- {field}:"):].strip()
+        # Format 2: '## field' followed by value on next line
         if stripped.lower() == f"## {field}" and i + 1 < len(lines):
             val = lines[i + 1].strip()
             if val and not val.startswith("#"):
                 return val
+        # Format 3: bare 'field: value' (frontmatter style)
+        if stripped.startswith(f"{field}:") and not stripped.startswith("- "):
+            return stripped[len(f"{field}:"):].strip()
     return ""
 
 
@@ -403,6 +408,8 @@ def _edit_status(mcp: MCPClient, task_id: str, old_status: str, new_status: str)
         mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
     elif f"## status\n{old_status}" in content:
         mcp.edit(task_id, f"## status\n{old_status}", f"## status\n{new_status}")
+    elif f"\nstatus: {old_status}" in content:
+        mcp.edit(task_id, f"status: {old_status}", f"status: {new_status}")
     else:
         mcp.edit(task_id, f"- status: {old_status}", f"- status: {new_status}")
 
@@ -459,7 +466,7 @@ def claim_task(mcp: MCPClient, task_id: str) -> bool:
     try:
         data = _try_parse_json(content)
         if data is not None:
-            if data.get("status") != "pending":
+            if data.get("status", "pending") != "pending":
                 logger.info("Could not find pending status in task %s", task_id)
                 return False
             data["status"] = "claimed"
@@ -470,9 +477,12 @@ def claim_task(mcp: MCPClient, task_id: str) -> bool:
             mcp.edit(task_id, "## status\npending", "## status\nclaimed")
         elif "\n## status\n pending" in content:
             mcp.edit(task_id, "## status\n pending", "## status\nclaimed")
+        elif "\nstatus: pending" in content:
+            mcp.edit(task_id, "status: pending", "status: claimed")
         else:
-            logger.info("Could not find pending status in task %s", task_id)
-            return False
+            # No status field at all — insert one via append
+            mcp.write(task_id, content.rstrip() + "\nstatus: claimed\n")
+            logger.info("Inserted missing status field as 'claimed' in %s", task_id)
         append_log(mcp, task_id, AGENT_ID, "Claimed task")
         return True
     except Exception as e:
@@ -493,12 +503,13 @@ def execute_task(mcp: MCPClient, task_id: str):
 
     # Verify it's for us (handle both 'target' and 'assigned_to')
     target = parse_task_field(content, "target") or parse_task_field(content, "assigned_to")
+    target = target.lstrip("@")  # normalize @vps → vps
     if target and target != AGENT_ID:
         logger.info("Task %s is for '%s', not us ('%s'). Skipping.", task_id, target, AGENT_ID)
         return
 
-    # Check status
-    status = parse_task_field(content, "status")
+    # Check status — treat missing/empty status as "pending"
+    status = parse_task_field(content, "status") or "pending"
     if status != "pending":
         logger.info("Task %s status is '%s', not 'pending'. Skipping.", task_id, status)
         return
@@ -815,8 +826,8 @@ def check_pending_tasks(mcp: MCPClient):
                 continue
             try:
                 content = mcp.read(filename)
-                status = parse_task_field(content, "status")
-                target = parse_task_field(content, "target")
+                status = parse_task_field(content, "status") or "pending"
+                target = parse_task_field(content, "target").lstrip("@")
                 if status == "pending" and (not target or target == AGENT_ID):
                     logger.info("Found pending task from before disconnect: %s", filename)
                     thread = threading.Thread(
