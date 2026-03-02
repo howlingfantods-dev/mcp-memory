@@ -51,7 +51,7 @@ When the user mentions `@agent_id` in a message (e.g. "@arch check the logs", "@
 2. **Notify the agent** with `notify_agent("{agent_id}", "{task_filename}")`
    - Use `notify_agent("here", "{task_filename}")` to broadcast to all connected agents
 
-3. **Tell the user** the task was dispatched and how to check results
+3. **Wait for the result** with `await_task("{task_filename}", timeout=120)` — this blocks until the task completes and returns the result directly. Only skip this if the user explicitly says they don't want to wait.
 
 ### Task types
 
@@ -132,11 +132,11 @@ The `files` field is required for code-edit tasks. The daemon will:
 
 ## Checking Results
 
-When the user asks about a dispatched task ("what did thinkpad say?", "is it done?"):
-1. `read_memory("{task_filename}")` to check the task file
-2. If status is `completed` → show the Result section
-3. If status is `running` or `pending` → let the user know it's still in progress
-4. If status is `failed` → show the error
+Use `await_task("{task_filename}", timeout=120)` to block until a task completes and get the result directly. This is the default — always await unless the user says otherwise.
+
+If `await_task` times out while the task is still running, it returns recent thinking output so you can report progress. If it times out while still pending, the agent likely never picked it up.
+
+For manual checking (e.g. old tasks): `read_memory("{task_filename}")` and look at the status/result fields.
 
 ## File Locking
 
