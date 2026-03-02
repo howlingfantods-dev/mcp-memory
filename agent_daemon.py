@@ -22,6 +22,7 @@ Environment variables:
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -263,7 +264,8 @@ def parse_files_list(content: str) -> list[str]:
 
 def lock_filename(filepath: str) -> str:
     """Convert a filepath to a lock filename: agent_daemon.py → lock-agent-daemon-py.md"""
-    safe = filepath.replace("/", "-").replace("\\", "-").replace(".", "-").replace("_", "-")
+    filepath = os.path.expanduser(filepath)
+    safe = re.sub(r"[^a-zA-Z0-9\-]", "-", filepath).strip("-")
     return f"lock-{safe}.md"
 
 
@@ -512,7 +514,7 @@ def execute_task(mcp: MCPClient, task_id: str):
     # Verify it's for us (handle both 'target' and 'assigned_to')
     target = parse_task_field(content, "target") or parse_task_field(content, "assigned_to")
     target = target.lstrip("@")  # normalize @vps → vps
-    if target and target != AGENT_ID:
+    if target and target not in (AGENT_ID, "here"):
         logger.info("Task %s is for '%s', not us ('%s'). Skipping.", task_id, target, AGENT_ID)
         return
 
