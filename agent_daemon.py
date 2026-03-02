@@ -916,7 +916,7 @@ def check_pending_tasks(mcp: MCPClient):
                 content = mcp.read(filename)
                 status = parse_task_field(content, "status") or "pending"
                 target = parse_task_field(content, "target").lstrip("@")
-                if status == "pending" and (not target or target == AGENT_ID):
+                if status == "pending" and (not target or target in (AGENT_ID, "here")):
                     logger.info("Found pending task from before disconnect: %s", filename)
                     thread = threading.Thread(
                         target=execute_task,
