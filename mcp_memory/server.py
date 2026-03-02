@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,12 +45,8 @@ logger = logging.getLogger("mcp-memory")
 FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.(md|json)$")
 DEVICES_FILE = DATA_DIR / "devices.json"
 
-_event_id = 0
-
-def _next_event_id() -> int:
-    global _event_id
-    _event_id += 1
-    return _event_id
+def _next_event_id() -> str:
+    return str(uuid.uuid4())
 
 
 _REQUEST_HEADERS = {"## request", "## prompt", "## instructions", "## instruction", "## description"}
@@ -504,6 +501,13 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         evt["query"] = query
     if action == "response":
         evt["errors"] = errors if "errors" in dir() else []
+        created_str = data.get("created", "") if data else _parse_md_field(content, "created")
+        if created_str:
+            try:
+                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                evt["response_time_ms"] = int((datetime.now(timezone.utc) - created_dt).total_seconds() * 1000)
+            except (ValueError, TypeError):
+                pass
     evt.update(cf)
     emit_monitor_event(evt)
 

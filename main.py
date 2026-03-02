@@ -237,7 +237,12 @@ async def handle_sse(scope, receive, send):
 # ── Monitor SSE endpoint ──────────────────────────────────────────────
 
 async def handle_monitor_sse(scope, receive, send):
-    """SSE endpoint: /monitor — broadcasts all server activity."""
+    """SSE endpoint: /monitor and /monitor/{alias} — broadcasts server activity."""
+    path = scope["path"].rstrip("/")
+    parts = path.split("/")
+    # /monitor/{alias} → filter to that agent; /monitor → all events
+    agent_filter = parts[2] if len(parts) >= 3 and parts[2] else None
+
     q = monitor_subscribe()
 
     await send({
@@ -249,9 +254,10 @@ async def handle_monitor_sse(scope, receive, send):
             (b"x-accel-buffering", b"no"),
         ],
     })
+    label = f"monitor/@{agent_filter}" if agent_filter else "monitor"
     await send({
         "type": "http.response.body",
-        "body": b": connected to monitor\n\n",
+        "body": f": connected to {label}\n\n".encode(),
         "more_body": True,
     })
 
@@ -278,7 +284,12 @@ async def handle_monitor_sse(scope, receive, send):
 
             if queue_task in done:
                 event = queue_task.result()
-                event_type = event.get("type", "unknown")
+                # Per-agent filtering: skip events that don't match
+                if agent_filter:
+                    event_agent = event.get("agent", "")
+                    if event_agent and event_agent != f"@{agent_filter}":
+                        continue
+                event_type = event.get("action", "unknown")
                 data = json.dumps(event)
                 await send({
                     "type": "http.response.body",
@@ -286,12 +297,8 @@ async def handle_monitor_sse(scope, receive, send):
                     "more_body": True,
                 })
             else:
+                # Timeout — no keepalive, just loop back
                 queue_task.cancel()
-                await send({
-                    "type": "http.response.body",
-                    "body": b": keepalive\n\n",
-                    "more_body": True,
-                })
     finally:
         disconnect_task.cancel()
         monitor_unsubscribe(q)
@@ -508,7 +515,7 @@ async def app(scope, receive, send):
         if path.startswith("/events/"):
             await handle_sse(scope, receive, send)
             return
-        if path.rstrip("/") == "/monitor":
+        if path.rstrip("/") == "/monitor" or path.startswith("/monitor/"):
             await handle_monitor_sse(scope, receive, send)
             return
         if path.rstrip("/") == "/health":
