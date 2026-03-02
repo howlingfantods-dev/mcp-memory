@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -108,6 +109,36 @@ def _client_fields(ctx: Context) -> dict:
         # Daemon entries have a "daemon" field in devices.json
         fields["is_daemon"] = bool(entry.get("daemon"))
     return fields
+
+
+# ── Thinking buffer ──────────────────────────────────────────────────
+
+_thinking_buffer: dict[str, deque] = {}
+THINKING_BUFFER_SIZE = 50
+
+
+def store_thinking_chunk(agent_id: str, task_id: str, text: str):
+    key = task_id
+    if key not in _thinking_buffer:
+        _thinking_buffer[key] = deque(maxlen=THINKING_BUFFER_SIZE)
+    _thinking_buffer[key].append(text)
+    emit_monitor_event({
+        "action": "thinking",
+        "agent": "@" + agent_id,
+        "task": task_id,
+        "content": text[:200],
+    })
+
+
+def get_thinking_lines(task_id: str) -> list[str]:
+    buf = _thinking_buffer.get(task_id)
+    if not buf:
+        return []
+    return list(buf)
+
+
+def clear_thinking_buffer(task_id: str):
+    _thinking_buffer.pop(task_id, None)
 
 
 # ── Tools ────────────────────────────────────────────────────────────
@@ -488,3 +519,81 @@ def register_device(name: str, model: str = "", cpu: str = "", ram: str = "", gp
 
     emit_monitor_event({"action": "request", "tool": "register_device", "device": name, "client": cid})
     return f"Registered client {cid[:8]}... as '{name}'."
+
+
+def _extract_result(data: dict | None, content: str) -> str:
+    if data is not None:
+        return data.get("result", "")
+    in_result = False
+    result_lines = []
+    for line in content.splitlines():
+        if line.strip().lower() in ("## result",):
+            in_result = True
+            continue
+        if in_result:
+            if line.startswith("## ") or line.startswith("# "):
+                break
+            result_lines.append(line)
+    return "\n".join(result_lines).strip()
+
+
+@mcp.tool()
+async def await_task(task_id: str, timeout: int = 120, ctx: Context = None) -> str:
+    """Block until a task completes and return its result.
+
+    Polls the task file every 3 seconds. On completion or failure, returns
+    the result text. On timeout while still pending, raises an error. On
+    timeout while in progress, returns recent thinking lines.
+
+    Args:
+        task_id: Task filename (e.g. "task-20260301-1430-obs.json")
+        timeout: Max seconds to wait (default 120)
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_status = "unknown"
+
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+
+        path = _validate_filename(task_id)
+        if not path.exists():
+            await asyncio.sleep(min(3, remaining))
+            continue
+
+        content = path.read_text()
+        data = None
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        if data is not None:
+            last_status = data.get("status", "pending")
+        else:
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- status:"):
+                    last_status = stripped[len("- status:"):].strip()
+                    break
+
+        if last_status in ("completed", "failed"):
+            result = _extract_result(data, content)
+            clear_thinking_buffer(task_id)
+            if last_status == "failed":
+                return f"FAILED: {result}" if result else "FAILED: (no details)"
+            return result or "(no result)"
+
+        await asyncio.sleep(min(3, remaining))
+
+    # Timed out
+    if last_status in ("pending", "unknown"):
+        raise TimeoutError(f"Task '{task_id}' was never picked up (status: {last_status}) after {timeout}s")
+
+    # In progress — return thinking lines so caller knows what's happening
+    lines = get_thinking_lines(task_id)
+    if lines:
+        preview = "\n".join(lines[-10:])
+        return f"TIMEOUT (still {last_status}). Recent activity:\n{preview}"
+    return f"TIMEOUT (still {last_status}). No thinking data available."

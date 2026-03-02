@@ -333,5 +333,8 @@ class MCPClient:
     def notify_agent(self, agent_id: str, task_id: str) -> str:
         return self._call_tool("notify_agent", {"agent_id": agent_id, "task_id": task_id})
 
+    def await_task(self, task_id: str, timeout: int = 120) -> str:
+        return self._call_tool("await_task", {"task_id": task_id, "timeout": timeout})
+
     def close(self):
         self._client.close()

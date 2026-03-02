@@ -8,6 +8,7 @@ from mcp_memory.config import DATA_DIR, PORT
 from mcp_memory.server import (
     mcp, agent_subscribe, agent_unsubscribe,
     monitor_subscribe, monitor_unsubscribe,
+    store_thinking_chunk,
     _agent_queues,
 )
 
@@ -104,6 +105,52 @@ def _patch_metadata(path: str, data: dict) -> dict:
         data["authorization_servers"] = [s.rstrip("/") for s in servers]
 
     return data
+
+
+# ── JSON response helper ──────────────────────────────────────────────
+
+async def _json_response(send, status: int, data: dict):
+    body = json.dumps(data).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+# ── Thinking endpoint ────────────────────────────────────────────────
+
+async def handle_thinking(scope, receive, send):
+    """POST /thinking/{agent_id}/{task_id} — store a thinking chunk."""
+    path = scope["path"].rstrip("/")
+    parts = path.split("/")
+    # Expect /thinking/{agent_id}/{task_id}
+    if len(parts) != 4 or parts[1] != "thinking" or not parts[2] or not parts[3]:
+        await _json_response(send, 404, {"error": "Not Found"})
+        return
+
+    if scope.get("method", "GET") != "POST":
+        await _json_response(send, 405, {"error": "Method Not Allowed"})
+        return
+
+    agent_id = parts[2]
+    task_id = parts[3]
+
+    # Read POST body
+    body_parts = []
+    while True:
+        msg = await receive()
+        body_parts.append(msg.get("body", b""))
+        if not msg.get("more_body", False):
+            break
+    text = b"".join(body_parts).decode("utf-8", errors="replace")
+
+    store_thinking_chunk(agent_id, task_id, text)
+    await _json_response(send, 200, {"ok": True})
 
 
 # ── SSE endpoint for agent task notifications ───────────────────────
@@ -455,6 +502,9 @@ async def app(scope, receive, send):
     """Root ASGI app. Routes SSE and monitor before MCP middleware."""
     if scope["type"] == "http":
         path = scope.get("path", "")
+        if path.startswith("/thinking/"):
+            await handle_thinking(scope, receive, send)
+            return
         if path.startswith("/events/"):
             await handle_sse(scope, receive, send)
             return

@@ -39,6 +39,7 @@ EVENT_COLORS = {
     "task": YELLOW,
     "request": YELLOW,
     "response": GREEN,
+    "thinking": DIM,
 }
 
 
@@ -145,6 +146,15 @@ def format_event(event: dict, use_color: bool) -> str:
         if event.get("duration_ms") is not None:
             parts.append(f"{event['duration_ms'] / 1000:.1f}s")
         return "  ".join(parts)
+
+    if etype == "thinking":
+        agent = event.get("agent", "")
+        task = event.get("task", "")
+        content = event.get("content", "")
+        preview = content.replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        return f"{ts} {color}{label}{reset} {agent}  {task}  {preview}"
 
     return f"{ts} {color}{label}{reset} {json.dumps(event)}"
 

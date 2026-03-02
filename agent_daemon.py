@@ -579,27 +579,81 @@ def _build_system_prompt(request_type: str, allowed_commands: list[str]) -> str:
     return "\n".join(constraints)
 
 
+def _flush_thinking(agent_id: str, task_id: str, text: str):
+    """Fire-and-forget POST of thinking text to the server."""
+    if not task_id:
+        return
+    try:
+        url = f"{MCP_URL}/thinking/{agent_id}/{task_id}"
+        httpx.post(url, content=text, timeout=5)
+    except Exception:
+        pass
+
+
 def _invoke_claude(request: str, system_prompt: str, timeout: int,
-                   allowed_tools: str = "Bash(.*)") -> tuple[str, bool]:
-    """Run claude --print and return (output, success)."""
+                   allowed_tools: str = "Bash(.*)",
+                   task_id: str = "") -> tuple[str, bool]:
+    """Run claude --print via Popen, streaming stdout to the thinking endpoint."""
     cmd = [
         "claude", "--print",
         "--dangerously-skip-permissions",
         "--allowedTools", allowed_tools,
         "--append-system-prompt", system_prompt,
     ]
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        input=request,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         cwd=REPO_DIR,
     )
-    output = result.stdout.strip()
-    if result.returncode != 0 and result.stderr:
-        output += f"\n\nSTDERR:\n{result.stderr.strip()}"
-    return output, result.returncode == 0
+    proc.stdin.write(request)
+    proc.stdin.close()
+
+    output_lines = []
+    lock = threading.Lock()
+
+    def reader():
+        for line in proc.stdout:
+            with lock:
+                output_lines.append(line.rstrip("\n"))
+
+    read_thread = threading.Thread(target=reader, daemon=True)
+    read_thread.start()
+
+    deadline = time.time() + timeout
+    last_flush = time.time()
+    flushed_count = 0
+
+    while read_thread.is_alive():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            read_thread.join(timeout=2)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        read_thread.join(timeout=min(1.0, remaining))
+        # Flush new lines as thinking
+        with lock:
+            new_lines = output_lines[flushed_count:]
+        if new_lines and (time.time() - last_flush >= 1.0 or not read_thread.is_alive()):
+            _flush_thinking(AGENT_ID, task_id, "\n".join(new_lines))
+            flushed_count += len(new_lines)
+            last_flush = time.time()
+
+    # Final flush of any remaining
+    with lock:
+        new_lines = output_lines[flushed_count:]
+    if new_lines:
+        _flush_thinking(AGENT_ID, task_id, "\n".join(new_lines))
+
+    proc.wait()
+    stderr = proc.stderr.read()
+    output = "\n".join(output_lines).strip()
+    if proc.returncode != 0 and stderr:
+        output += f"\n\nSTDERR:\n{stderr.strip()}"
+    return output, proc.returncode == 0
 
 
 def _execute_query(mcp: MCPClient, task_id: str, request: str,
@@ -611,7 +665,7 @@ def _execute_query(mcp: MCPClient, task_id: str, request: str,
 
     logger.info("Invoking claude --print for query task %s", task_id)
     try:
-        output, success = _invoke_claude(request, system_prompt, timeout)
+        output, success = _invoke_claude(request, system_prompt, timeout, task_id=task_id)
 
         _edit_result(mcp, task_id, output or "_(no output)_")
         _edit_status(mcp, task_id, "running", "completed")
@@ -660,7 +714,7 @@ def _execute_code_edit(mcp: MCPClient, task_id: str, request: str,
 
         logger.info("Invoking claude --print for code-edit task %s", task_id)
         try:
-            output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools)
+            output, success = _invoke_claude(request, system_prompt, timeout, allowed_tools, task_id=task_id)
         except subprocess.TimeoutExpired:
             _edit_status(mcp, task_id, "running", "failed")
             _edit_result(mcp, task_id, f"_(timed out after {timeout}s)_")
