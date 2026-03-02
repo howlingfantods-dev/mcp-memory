@@ -7,6 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/mcp-memory
 ExecStart=/root/.local/bin/uv run python3 main.py
+TimeoutStopSec=5
 Restart=always
 RestartSec=5
 

@@ -17,4 +17,6 @@ jobs:
           script: |
             cd /root/mcp-memory
             git pull --ff-only
+            cp mcp-memory.service /etc/systemd/system/mcp-memory.service
+            systemctl daemon-reload
             systemctl restart mcp-memory
