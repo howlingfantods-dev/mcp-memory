@@ -593,10 +593,13 @@ def _flush_thinking(agent_id: str, task_id: str, text: str):
 def _invoke_claude(request: str, system_prompt: str, timeout: int,
                    allowed_tools: str = "Bash(.*)",
                    task_id: str = "") -> tuple[str, bool]:
-    """Run claude --print via Popen, streaming stdout to the thinking endpoint."""
+    """Run claude --print with stream-json, forwarding text deltas as thinking."""
     cmd = [
         "claude", "--print",
         "--dangerously-skip-permissions",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
         "--allowedTools", allowed_tools,
         "--append-system-prompt", system_prompt,
     ]
@@ -611,21 +614,47 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
     proc.stdin.write(request)
     proc.stdin.close()
 
-    output_lines = []
+    result_text = ""
+    success = False
+    text_chunks = []
     lock = threading.Lock()
+    last_flush = time.time()
+
+    def flush_thinking():
+        nonlocal last_flush
+        with lock:
+            pending = "".join(text_chunks)
+            text_chunks.clear()
+        if pending:
+            _flush_thinking(AGENT_ID, task_id, pending)
+            last_flush = time.time()
 
     def reader():
-        for line in proc.stdout:
-            with lock:
-                output_lines.append(line.rstrip("\n"))
+        nonlocal result_text, success
+        for raw_line in proc.stdout:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            mtype = msg.get("type")
+            if mtype == "stream_event":
+                evt = msg.get("event", {})
+                if evt.get("type") == "content_block_delta":
+                    delta = evt.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        with lock:
+                            text_chunks.append(delta["text"])
+            elif mtype == "result":
+                result_text = msg.get("result", "")
+                success = not msg.get("is_error", False)
 
     read_thread = threading.Thread(target=reader, daemon=True)
     read_thread.start()
 
     deadline = time.time() + timeout
-    last_flush = time.time()
-    flushed_count = 0
-
     while read_thread.is_alive():
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -634,26 +663,19 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
             read_thread.join(timeout=2)
             raise subprocess.TimeoutExpired(cmd, timeout)
         read_thread.join(timeout=min(1.0, remaining))
-        # Flush new lines as thinking
-        with lock:
-            new_lines = output_lines[flushed_count:]
-        if new_lines and (time.time() - last_flush >= 1.0 or not read_thread.is_alive()):
-            _flush_thinking(AGENT_ID, task_id, "\n".join(new_lines))
-            flushed_count += len(new_lines)
-            last_flush = time.time()
+        if time.time() - last_flush >= 1.0:
+            flush_thinking()
 
-    # Final flush of any remaining
-    with lock:
-        new_lines = output_lines[flushed_count:]
-    if new_lines:
-        _flush_thinking(AGENT_ID, task_id, "\n".join(new_lines))
-
+    flush_thinking()
     proc.wait()
-    stderr = proc.stderr.read()
-    output = "\n".join(output_lines).strip()
-    if proc.returncode != 0 and stderr:
-        output += f"\n\nSTDERR:\n{stderr.strip()}"
-    return output, proc.returncode == 0
+
+    if not result_text and proc.returncode != 0:
+        stderr = proc.stderr.read()
+        result_text = f"Process exited {proc.returncode}"
+        if stderr:
+            result_text += f"\n\nSTDERR:\n{stderr.strip()}"
+
+    return result_text, success
 
 
 def _execute_query(mcp: MCPClient, task_id: str, request: str,
