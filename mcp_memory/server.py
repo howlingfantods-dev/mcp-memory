@@ -19,6 +19,7 @@ from mcp_memory.oauth_provider import PersistentOAuthProvider
 
 mcp = FastMCP(
     "memory",
+    stateless_http=True,
     auth_server_provider=PersistentOAuthProvider(),
     auth=AuthSettings(
         issuer_url="https://mcp.howling.one",

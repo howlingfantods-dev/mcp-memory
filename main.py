@@ -14,33 +14,7 @@ from mcp_memory.server import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-memory")
 
-_raw_mcp_app = mcp.streamable_http_app()
-
-
-async def inner_app(scope, receive, send):
-    """Wrap MCP app with stale session recovery.
-
-    When the server restarts, existing clients still send the old
-    mcp-session-id header.  The library returns 404 "Session not found".
-    This middleware detects stale IDs and strips the header so the
-    library auto-creates a fresh session instead.
-    """
-    if scope["type"] == "http":
-        session_id = None
-        for name, value in scope.get("headers", []):
-            if name == b"mcp-session-id":
-                session_id = value.decode()
-                break
-
-        sm = getattr(mcp, "_session_manager", None)
-        if session_id and sm and session_id not in sm._server_instances:
-            scope = dict(scope)
-            scope["headers"] = [
-                (n, v) for n, v in scope["headers"] if n != b"mcp-session-id"
-            ]
-            logger.info("Stripped stale session %s…, auto-creating new session", session_id[:8])
-
-    await _raw_mcp_app(scope, receive, send)
+inner_app = mcp.streamable_http_app()
 
 
 async def patch_metadata_middleware(scope, receive, send):
