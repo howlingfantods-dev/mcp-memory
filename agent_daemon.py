@@ -613,6 +613,7 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
         "--allowedTools", allowed_tools,
         "--append-system-prompt", system_prompt,
     ]
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -620,6 +621,7 @@ def _invoke_claude(request: str, system_prompt: str, timeout: int,
         stderr=subprocess.PIPE,
         text=True,
         cwd=REPO_DIR,
+        env=env,
     )
     proc.stdin.write(request)
     proc.stdin.close()
