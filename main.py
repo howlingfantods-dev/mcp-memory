@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 
@@ -10,6 +11,10 @@ from mcp_memory.server import (
     monitor_subscribe, monitor_unsubscribe,
     store_thinking_chunk,
     _agent_queues,
+    _heartbeats,
+    update_heartbeat as server_update_heartbeat,
+    acquire_lock as server_acquire_lock,
+    release_lock as server_release_lock,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -153,6 +158,47 @@ async def handle_thinking(scope, receive, send):
     await _json_response(send, 200, {"ok": True})
 
 
+# ── Heartbeat endpoint ────────────────────────────────────────────────
+
+async def handle_heartbeat(scope, receive, send):
+    """POST /heartbeat/{agent_id} — update in-memory heartbeat."""
+    path = scope["path"].rstrip("/")
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] != "heartbeat" or not parts[2]:
+        await _json_response(send, 404, {"error": "Not Found"})
+        return
+    if scope.get("method", "GET") != "POST":
+        await _json_response(send, 405, {"error": "Method Not Allowed"})
+        return
+    agent_id = parts[2]
+    server_update_heartbeat(agent_id)
+    await _json_response(send, 200, {"ok": True})
+
+
+# ── Lock endpoints ────────────────────────────────────────────────────
+
+async def handle_lock(scope, receive, send):
+    """POST /lock/{agent_id}/{filename} — acquire lock.
+    DELETE /lock/{agent_id}/{filename} — release lock."""
+    path = scope["path"].rstrip("/")
+    parts = path.split("/")
+    if len(parts) != 4 or parts[1] != "lock" or not parts[2] or not parts[3]:
+        await _json_response(send, 404, {"error": "Not Found"})
+        return
+    agent_id = parts[2]
+    filename = parts[3]
+    method = scope.get("method", "GET")
+    if method == "POST":
+        result = server_acquire_lock(agent_id, filename)
+        status = 200 if result["ok"] else 409
+        await _json_response(send, status, result)
+    elif method == "DELETE":
+        result = server_release_lock(agent_id, filename)
+        await _json_response(send, 200, result)
+    else:
+        await _json_response(send, 405, {"error": "Method Not Allowed"})
+
+
 # ── SSE endpoint for agent task notifications ───────────────────────
 
 SSE_KEEPALIVE_SECONDS = 30
@@ -237,12 +283,7 @@ async def handle_sse(scope, receive, send):
 # ── Monitor SSE endpoint ──────────────────────────────────────────────
 
 async def handle_monitor_sse(scope, receive, send):
-    """SSE endpoint: /monitor and /monitor/{alias} — broadcasts server activity."""
-    path = scope["path"].rstrip("/")
-    parts = path.split("/")
-    # /monitor/{alias} → filter to that agent; /monitor → all events
-    agent_filter = parts[2] if len(parts) >= 3 and parts[2] else None
-
+    """SSE endpoint: /monitor — broadcasts all server activity."""
     q = monitor_subscribe()
 
     await send({
@@ -254,10 +295,9 @@ async def handle_monitor_sse(scope, receive, send):
             (b"x-accel-buffering", b"no"),
         ],
     })
-    label = f"monitor/@{agent_filter}" if agent_filter else "monitor"
     await send({
         "type": "http.response.body",
-        "body": f": connected to {label}\n\n".encode(),
+        "body": b": connected to monitor\n\n",
         "more_body": True,
     })
 
@@ -284,12 +324,7 @@ async def handle_monitor_sse(scope, receive, send):
 
             if queue_task in done:
                 event = queue_task.result()
-                # Per-agent filtering: skip events that don't match
-                if agent_filter:
-                    event_agent = event.get("agent", "")
-                    if event_agent and event_agent != f"@{agent_filter}":
-                        continue
-                event_type = event.get("action", "unknown")
+                event_type = event.get("type", "unknown")
                 data = json.dumps(event)
                 await send({
                     "type": "http.response.body",
@@ -297,8 +332,12 @@ async def handle_monitor_sse(scope, receive, send):
                     "more_body": True,
                 })
             else:
-                # Timeout — no keepalive, just loop back
                 queue_task.cancel()
+                await send({
+                    "type": "http.response.body",
+                    "body": b": keepalive\n\n",
+                    "more_body": True,
+                })
     finally:
         disconnect_task.cancel()
         monitor_unsubscribe(q)
@@ -375,26 +414,15 @@ def _get_node_statuses() -> list[dict]:
 
         last_seen = ""
         heartbeat_ago = None
-        reg_path = DATA_DIR / f"agent-reg-{name}.md"
-        if reg_path.exists():
-            try:
-                for line in reg_path.read_text().splitlines():
-                    if "- last_seen:" in line:
-                        ts = line.split("- last_seen:")[1].strip()
-                        try:
-                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                            heartbeat_ago = (now - dt).total_seconds()
-                            if heartbeat_ago < 60:
-                                last_seen = f"{int(heartbeat_ago)}s ago"
-                            elif heartbeat_ago < 3600:
-                                last_seen = f"{int(heartbeat_ago/60)}m ago"
-                            else:
-                                last_seen = f"{int(heartbeat_ago/3600)}h ago"
-                        except Exception:
-                            last_seen = ts
-                        break
-            except Exception:
-                pass
+        hb_ts = _heartbeats.get(name)
+        if hb_ts is not None:
+            heartbeat_ago = (now - hb_ts).total_seconds()
+            if heartbeat_ago < 60:
+                last_seen = f"{int(heartbeat_ago)}s ago"
+            elif heartbeat_ago < 3600:
+                last_seen = f"{int(heartbeat_ago/60)}m ago"
+            else:
+                last_seen = f"{int(heartbeat_ago/3600)}h ago"
 
         online = has_sse and (heartbeat_ago is None or heartbeat_ago < HEARTBEAT_STALE_SECONDS)
         nodes.append({
@@ -433,31 +461,31 @@ def _build_health_page() -> str:
 
         details = []
         if node["aliases"]:
-            details.append(f"<b>{node['aliases']}</b>")
+            details.append(f"<b>{html.escape(node['aliases'])}</b>")
         if node["model"]:
-            details.append(node["model"])
+            details.append(html.escape(node["model"]))
         if node["os"]:
-            platform = node["os"]
+            platform = html.escape(node["os"])
             if node["env"] and node["env"] != "bare metal":
-                platform += f" ({node['env']})"
+                platform += f" ({html.escape(node['env'])})"
             details.append(platform)
         cpu = entry.get("cpu", "")
         if cpu:
-            details.append(f"CPU: <span>{cpu}</span>")
+            details.append(f"CPU: <span>{html.escape(cpu)}</span>")
         ram = entry.get("ram", "")
         if ram:
-            details.append(f"RAM: <span>{ram}</span>")
+            details.append(f"RAM: <span>{html.escape(ram)}</span>")
         gpu = entry.get("gpu", "")
         if gpu and "Virtio" not in gpu:
             short_gpu = gpu.split("(")[0].strip() if len(gpu) > 40 else gpu
-            details.append(f"GPU: <span>{short_gpu}</span>")
+            details.append(f"GPU: <span>{html.escape(short_gpu)}</span>")
         if node["last_seen"]:
-            details.append(f"Last seen: <span>{node['last_seen']}</span>")
+            details.append(f"Last seen: <span>{html.escape(node['last_seen'])}</span>")
 
         cards.append(NODE_CARD.format(
-            name=f"@{name}",
-            status=status,
-            status_class=status,
+            name=html.escape(f"@{name}"),
+            status=html.escape(status),
+            status_class=html.escape(status),
             details="<br>".join(details),
         ))
 
@@ -512,10 +540,16 @@ async def app(scope, receive, send):
         if path.startswith("/thinking/"):
             await handle_thinking(scope, receive, send)
             return
+        if path.startswith("/heartbeat/"):
+            await handle_heartbeat(scope, receive, send)
+            return
+        if path.startswith("/lock/"):
+            await handle_lock(scope, receive, send)
+            return
         if path.startswith("/events/"):
             await handle_sse(scope, receive, send)
             return
-        if path.rstrip("/") == "/monitor" or path.startswith("/monitor/"):
+        if path.rstrip("/") == "/monitor":
             await handle_monitor_sse(scope, receive, send)
             return
         if path.rstrip("/") == "/health":
