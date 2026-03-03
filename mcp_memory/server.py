@@ -49,88 +49,6 @@ def _next_event_id() -> str:
     return str(uuid.uuid4())
 
 
-_REQUEST_HEADERS = {"## request", "## prompt", "## instructions", "## instruction", "## description"}
-
-
-def _parse_md_field(content: str, field: str) -> str:
-    """Extract a field value from markdown task content, tolerant of formatting.
-
-    Handles: '- field: val', '**field:** val', '## field\\nval', 'field: val'.
-    """
-    lines = content.splitlines()
-    for i, line in enumerate(lines):
-        clean = line.strip().replace('*', '').replace('_', '')
-        if clean.startswith(f"- {field}:"):
-            return clean[len(f"- {field}:"):].strip()
-        if clean.lower() == f"## {field}" and i + 1 < len(lines):
-            val = lines[i + 1].strip()
-            if val and not val.startswith("#"):
-                return val
-        if clean.startswith(f"{field}:") and not clean.startswith(f"- {field}:"):
-            return clean[len(f"{field}:"):].strip()
-    return ""
-
-
-def _parse_md_section(content: str, headers: set[str]) -> str:
-    """Extract body text under any matching ## header."""
-    lines = []
-    in_section = False
-    for line in content.splitlines():
-        header = line.strip().replace('*', '').replace('_', '').lower()
-        if header in headers:
-            in_section = True
-            continue
-        if in_section:
-            if line.startswith("## ") or line.startswith("# "):
-                break
-            lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _normalize_task_content(content: str) -> str | None:
-    """Normalize markdown task content to JSON. Returns JSON string or None if already JSON."""
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            return None  # already JSON
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    task = {
-        "title": _parse_md_field(content, "title") or "",
-        "status": _parse_md_field(content, "status") or "pending",
-        "type": _parse_md_field(content, "type") or "query",
-        "created": _parse_md_field(content, "created") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "created_by": _parse_md_field(content, "created_by") or "user",
-        "target": _parse_md_field(content, "target") or "",
-        "timeout": int(_parse_md_field(content, "timeout") or "120"),
-        "request": _parse_md_section(content, _REQUEST_HEADERS) or "",
-        "allowed_commands": [],
-        "files": [],
-        "result": None,
-        "log": [{"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "agent": "server", "msg": "Normalized from markdown"}],
-    }
-
-    # Parse allowed_commands from ## Allowed Commands section
-    in_cmds = False
-    for line in content.splitlines():
-        if line.strip() == "## Allowed Commands":
-            in_cmds = True
-            continue
-        if in_cmds:
-            if line.startswith("## ") or line.startswith("# "):
-                break
-            stripped = line.strip()
-            if stripped.startswith("- "):
-                task["allowed_commands"].append(stripped[2:])
-
-    # Parse files
-    raw_files = _parse_md_field(content, "files")
-    if raw_files:
-        task["files"] = [f.strip() for f in raw_files.split(",") if f.strip()]
-
-    return json.dumps(task, indent=2)
-
 
 def _validate_filename(filename: str) -> Path:
     if not FILENAME_RE.match(filename):
@@ -261,22 +179,16 @@ def write_memory(filename: str, content: str, ctx: Context = None) -> str:
         filename: Name of the .md file to write (e.g. "MEMORY.md")
         content: Full markdown content to write
     """
-    # Normalize markdown tasks to JSON on write
-    if filename.startswith("task-"):
-        normalized = _normalize_task_content(content)
-        if normalized is not None:
-            content = normalized
-        if filename.endswith(".md"):
-            old_path = _validate_filename(filename)
-            filename = filename[:-3] + ".json"
-            # Clean up the .md file if it exists
-            if old_path.exists():
-                old_path.unlink()
-
     path = _validate_filename(filename)
     path.write_text(content)
-    if filename.startswith("task-") and filename.endswith(".json"):
-        _emit_task_event(filename, content)
+    if filename.endswith(".json"):
+        # Emit monitor event for task files (have a "status" field)
+        try:
+            data = json.loads(content)
+            if "status" in data:
+                _emit_task_event(filename, content)
+        except (json.JSONDecodeError, ValueError):
+            pass
     return f"Wrote {len(content)} bytes to {filename}."
 
 
@@ -317,7 +229,7 @@ async def create_task(target: str, request: str, task_type: str = "query",
         allowed_commands: Optional list of shell commands the agent may run
         files: Optional list of file paths (required for code-edit tasks)
     """
-    task_id = f"task-{uuid.uuid4()}.json"
+    task_id = f"{uuid.uuid4()}.json"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     cf = _client_fields(ctx)
@@ -521,48 +433,13 @@ def emit_monitor_event(event: dict):
 @mcp.tool()
 def _set_task_target(content: str, agent_id: str) -> str:
     """Set or replace the target field in a task file."""
-    # Try JSON first
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            data["target"] = agent_id
-            return json.dumps(data, indent=2)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Markdown fallback (for normalization layer)
-    lines = content.splitlines()
-    new_lines = []
-    found = False
-    for line in lines:
-        clean = line.strip().replace('*', '').replace('_', '')
-        if clean.startswith("- target:") or (clean.startswith("target:") and not clean.startswith("- target:")):
-            new_lines.append(f"- target: {agent_id}")
-            found = True
-        elif clean.lower() == "## target":
-            new_lines.append(line)
-            found = "header"
-        elif found == "header":
-            new_lines.append(agent_id)
-            found = True
-        else:
-            new_lines.append(line)
-    if not found:
-        final = []
-        inserted = False
-        for line in new_lines:
-            header = line.strip().replace('*', '').replace('_', '').lower()
-            if not inserted and header in _REQUEST_HEADERS:
-                final.append(f"- target: {agent_id}")
-                final.append("")
-                inserted = True
-            final.append(line)
-        new_lines = final
-    return "\n".join(new_lines)
+    data = json.loads(content)
+    data["target"] = agent_id
+    return json.dumps(data, indent=2)
 
 
 @mcp.tool()
-async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
+async def notify_agent(agent_id: str, id: str, ctx: Context = None) -> str:
     """Send a notification to an agent about a new task.
 
     The agent must be connected via SSE to receive the notification.
@@ -573,8 +450,9 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
 
     Args:
         agent_id: Target agent ID (e.g. "thinkpad", "here" for all connected)
-        task_id: Task filename to notify about (e.g. "task-20260301-1430-obs.md")
+        id: Task filename (e.g. "ae4f2b.json")
     """
+    task_id = id
     # @here: broadcast to all connected agents
     if agent_id == "here":
         if not _agent_queues:
@@ -587,14 +465,10 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         template = task_path.read_text()
         results = []
         for aid in connected:
-            agent_task_id = f"task-{uuid.uuid4()}.json"
-            # Set target via JSON dict or markdown fallback
-            try:
-                data = json.loads(template)
-                data["target"] = aid
-                agent_content = json.dumps(data, indent=2)
-            except (json.JSONDecodeError, ValueError):
-                agent_content = _set_task_target(template, aid)
+            agent_task_id = f"{uuid.uuid4()}.json"
+            data = json.loads(template)
+            data["target"] = aid
+            agent_content = json.dumps(data, indent=2)
             agent_path = DATA_DIR / agent_task_id
             agent_path.write_text(agent_content)
             result = await notify_agent(aid, agent_task_id, ctx)
@@ -666,7 +540,7 @@ async def notify_agent(agent_id: str, task_id: str, ctx: Context = None) -> str:
         evt["query"] = query
     if action == "response":
         evt["errors"] = errors if "errors" in dir() else []
-        created_str = data.get("created", "") if data else _parse_md_field(content, "created")
+        created_str = data.get("created", "") if data else ""
         if created_str:
             try:
                 created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
@@ -733,7 +607,7 @@ def _extract_result(data: dict) -> str:
 
 
 @mcp.tool()
-async def await_task(task_id: str, timeout: int = 120, ctx: Context = None) -> str:
+async def await_task(id: str, timeout: int = 120, ctx: Context = None) -> str:
     """Block until a task completes and return its result.
 
     Polls the task file every 3 seconds. On completion or failure, returns
@@ -741,9 +615,10 @@ async def await_task(task_id: str, timeout: int = 120, ctx: Context = None) -> s
     timeout while in progress, returns recent thinking lines.
 
     Args:
-        task_id: Task filename (e.g. "task-20260301-1430-obs.json")
+        id: Task filename (e.g. "ae4f2b.json")
         timeout: Max seconds to wait (default 120)
     """
+    task_id = id
     deadline = asyncio.get_event_loop().time() + timeout
     last_status = "unknown"
 

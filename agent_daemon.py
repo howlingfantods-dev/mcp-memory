@@ -601,7 +601,7 @@ def _notify_creator(mcp: MCPClient, task_id: str, content: str):
     created_by = data.get("created_by", "") if data else ""
     if created_by and created_by != AGENT_ID:
         try:
-            mcp.notify_agent(created_by, task_id)
+            mcp.notify_agent(created_by, id=task_id)
             logger.info("Notified '%s' about completed task %s", created_by, task_id)
         except Exception:
             pass
@@ -677,20 +677,25 @@ def heartbeat_loop(mcp: MCPClient, interval: int):
 
 # ── Cleanup old tasks ────────────────────────────────────────────────
 
+def _is_task_file(filename: str) -> bool:
+    """Check if filename looks like a UUID task (not a named memory file)."""
+    return filename.endswith(".json") and filename != "devices.json"
+
+
 def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
     """Delete completed/failed tasks older than max_age_hours."""
     try:
-        file_list = mcp.list(prefix="task-")
+        file_list = mcp.list()
         if file_list == "No memory files found.":
             return
         for filename in file_list.splitlines():
             filename = filename.strip()
-            if not filename:
+            if not filename or not _is_task_file(filename):
                 continue
             try:
                 content = mcp.read(filename)
                 status = parse_task_field(content, "status")
-                if status not in ("completed", "failed"):
+                if not status or status not in ("completed", "failed"):
                     continue
                 created = parse_task_field(content, "created")
                 if not created:
@@ -711,12 +716,12 @@ def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
 def check_pending_tasks(mcp: MCPClient):
     """On startup, check for any pending tasks targeting this agent."""
     try:
-        file_list = mcp.list(prefix="task-")
+        file_list = mcp.list()
         if file_list == "No memory files found.":
             return
         for filename in file_list.splitlines():
             filename = filename.strip()
-            if not filename:
+            if not filename or not _is_task_file(filename):
                 continue
             try:
                 content = mcp.read(filename)

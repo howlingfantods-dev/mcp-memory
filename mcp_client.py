@@ -337,11 +337,11 @@ class MCPClient:
         args = {"target": target, "request": request, **kwargs}
         return self._call_tool("create_task", args)
 
-    def notify_agent(self, agent_id: str, task_id: str) -> str:
-        return self._call_tool("notify_agent", {"agent_id": agent_id, "task_id": task_id})
+    def notify_agent(self, agent_id: str, id: str) -> str:
+        return self._call_tool("notify_agent", {"agent_id": agent_id, "id": id})
 
-    def await_task(self, task_id: str, timeout: int = 120) -> str:
-        return self._call_tool("await_task", {"task_id": task_id, "timeout": timeout})
+    def await_task(self, id: str, timeout: int = 120) -> str:
+        return self._call_tool("await_task", {"id": id, "timeout": timeout})
 
     def close(self):
         self._client.close()
