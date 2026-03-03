@@ -412,23 +412,14 @@ def _get_node_statuses() -> list[dict]:
         entry = seen[name]
         has_sse = name in connected_agents
 
-        last_seen = ""
-        heartbeat_ago = None
         hb_ts = _heartbeats.get(name)
-        if hb_ts is not None:
-            heartbeat_ago = (now - hb_ts).total_seconds()
-            if heartbeat_ago < 60:
-                last_seen = f"{int(heartbeat_ago)}s ago"
-            elif heartbeat_ago < 3600:
-                last_seen = f"{int(heartbeat_ago/60)}m ago"
-            else:
-                last_seen = f"{int(heartbeat_ago/3600)}h ago"
+        heartbeat_ago = (now - hb_ts).total_seconds() if hb_ts else None
 
         online = has_sse and (heartbeat_ago is None or heartbeat_ago < HEARTBEAT_STALE_SECONDS)
         nodes.append({
             "name": name,
             "status": "online" if online else "offline",
-            "last_seen": last_seen,
+            "last_seen": int(hb_ts.timestamp()) if hb_ts else None,
             "aliases": entry.get("aliases", ""),
             "model": entry.get("model", ""),
             "os": entry.get("os", ""),
@@ -479,8 +470,15 @@ def _build_health_page() -> str:
         if gpu and "Virtio" not in gpu:
             short_gpu = gpu.split("(")[0].strip() if len(gpu) > 40 else gpu
             details.append(f"GPU: <span>{html.escape(short_gpu)}</span>")
-        if node["last_seen"]:
-            details.append(f"Last seen: <span>{html.escape(node['last_seen'])}</span>")
+        if node["last_seen"] is not None:
+            ago = int(now.timestamp()) - node["last_seen"]
+            if ago < 60:
+                ago_str = f"{ago}s ago"
+            elif ago < 3600:
+                ago_str = f"{ago // 60}m ago"
+            else:
+                ago_str = f"{ago // 3600}h ago"
+            details.append(f"Last seen: <span>{html.escape(ago_str)}</span>")
 
         cards.append(NODE_CARD.format(
             name=html.escape(f"@{name}"),
