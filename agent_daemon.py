@@ -28,7 +28,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 
 import httpx
 
@@ -52,8 +51,8 @@ BLOCKED_PATHS = os.environ.get("BLOCKED_PATHS", "/etc,/boot,~/.ssh").split(",")
 REPO_DIR = os.environ.get("REPO_DIR", os.getcwd())
 SYNCTHING_SETTLE_SECONDS = int(os.environ.get("SYNCTHING_SETTLE", "5"))
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def now_ts() -> int:
+    return int(time.time())
 
 
 def detect_gpu() -> str:
@@ -271,7 +270,7 @@ def append_log(mcp: MCPClient, task_id: str, agent: str, message: str, content: 
         return
     if "log" not in fresh or not isinstance(fresh["log"], list):
         fresh["log"] = []
-    fresh["log"].append({"ts": now_iso(), "agent": agent, "msg": message})
+    fresh["log"].append({"ts": now_ts(), "agent": agent, "msg": message})
     mcp.write(task_id, json.dumps(fresh, indent=2))
 
 
@@ -279,7 +278,7 @@ def _set_running(mcp: MCPClient, task_id: str, data: dict | None = None) -> dict
     """Transition task from claimed to running (single write for JSON)."""
     if data is not None:
         data["status"] = "running"
-        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": "Executing task"})
+        data.setdefault("log", []).append({"ts": now_ts(), "agent": AGENT_ID, "msg": "Executing task"})
         mcp.write(task_id, json.dumps(data, indent=2))
         return data
     content = mcp.read(task_id)
@@ -293,7 +292,7 @@ def _complete_task(mcp: MCPClient, task_id: str, result_text: str, log_msg: str,
     if data is not None:
         data["result"] = result_text
         data["status"] = "completed"
-        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": log_msg})
+        data.setdefault("log", []).append({"ts": now_ts(), "agent": AGENT_ID, "msg": log_msg})
         mcp.write(task_id, json.dumps(data, indent=2))
         return data
     content = mcp.read(task_id)
@@ -320,7 +319,7 @@ def claim_task(mcp: MCPClient, task_id: str, content: str | None = None) -> dict
             logger.info("Could not find pending status in task %s", task_id)
             return False
         data["status"] = "claimed"
-        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": "Claimed task"})
+        data.setdefault("log", []).append({"ts": now_ts(), "agent": AGENT_ID, "msg": "Claimed task"})
         mcp.write(task_id, json.dumps(data, indent=2))
         return data
     except Exception as e:
@@ -588,7 +587,7 @@ def _fail_task(mcp: MCPClient, task_id: str, error: str, data: dict | None = Non
             data = _try_parse_json(mcp.read(task_id)) or {}
         data["status"] = "failed"
         data["result"] = f"_(error: {error})_"
-        data.setdefault("log", []).append({"ts": now_iso(), "agent": AGENT_ID, "msg": f"Task failed: {error}"})
+        data.setdefault("log", []).append({"ts": now_ts(), "agent": AGENT_ID, "msg": f"Task failed: {error}"})
         mcp.write(task_id, json.dumps(data, indent=2))
     except Exception as e:
         logger.error("Failed to update task %s during failure handling: %s", task_id, e)
@@ -695,8 +694,7 @@ def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
                 created = parse_task_field(content, "created")
                 if not created:
                     continue
-                created_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                age_hours = (datetime.now(timezone.utc) - created_time).total_seconds() / 3600
+                age_hours = (int(time.time()) - int(created)) / 3600
                 if age_hours > max_age_hours:
                     mcp.delete(filename)
                     logger.info("Cleaned up old task: %s", filename)

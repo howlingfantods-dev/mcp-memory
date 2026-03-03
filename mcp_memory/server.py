@@ -2,9 +2,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.auth.settings import (
@@ -230,7 +230,7 @@ async def create_task(target: str, request: str, task_type: str = "query",
         files: Optional list of file paths (required for code-edit tasks)
     """
     task_id = f"{uuid.uuid4()}.json"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = int(time.time())
 
     cf = _client_fields(ctx)
     if cf.get("is_daemon"):
@@ -330,17 +330,17 @@ _agent_queues: dict[str, set[asyncio.Queue]] = {}
 
 # ── In-memory heartbeat + lock state ─────────────────────────────────
 
-_heartbeats: dict[str, datetime] = {}
-_locks: dict[str, dict] = {}  # filename -> {"agent_id": str, "acquired": datetime}
+_heartbeats: dict[str, int] = {}
+_locks: dict[str, dict] = {}  # filename -> {"agent_id": str, "acquired": int}
 
 HEARTBEAT_STALE_SECONDS = 600
 
 
 def update_heartbeat(agent_id: str):
-    _heartbeats[agent_id] = datetime.now(timezone.utc)
+    _heartbeats[agent_id] = int(time.time())
 
 
-def get_heartbeat(agent_id: str) -> datetime | None:
+def get_heartbeat(agent_id: str) -> int | None:
     return _heartbeats.get(agent_id)
 
 
@@ -350,8 +350,7 @@ def is_agent_alive(agent_id: str, stale_seconds: int = HEARTBEAT_STALE_SECONDS) 
     ts = _heartbeats.get(agent_id)
     if ts is None:
         return True  # connected via SSE but no heartbeat yet — assume alive
-    age = (datetime.now(timezone.utc) - ts).total_seconds()
-    return age < stale_seconds
+    return (int(time.time()) - ts) < stale_seconds
 
 
 def acquire_lock(agent_id: str, filename: str) -> dict:
@@ -362,7 +361,7 @@ def acquire_lock(agent_id: str, filename: str) -> dict:
         if is_agent_alive(existing["agent_id"]):
             return {"ok": False, "msg": f"locked by {existing['agent_id']}"}
         logger.info("Breaking stale lock on %s (held by %s)", filename, existing["agent_id"])
-    _locks[filename] = {"agent_id": agent_id, "acquired": datetime.now(timezone.utc)}
+    _locks[filename] = {"agent_id": agent_id, "acquired": int(time.time())}
     return {"ok": True, "msg": "acquired"}
 
 
@@ -419,7 +418,7 @@ def monitor_unsubscribe(q: asyncio.Queue):
 
 def emit_monitor_event(event: dict):
     event["id"] = _next_event_id()
-    event.setdefault("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    event.setdefault("ts", int(time.time()))
     dead = []
     for q in _monitor_queues:
         try:
@@ -540,13 +539,9 @@ async def notify_agent(agent_id: str, id: str, ctx: Context = None) -> str:
         evt["query"] = query
     if action == "response":
         evt["errors"] = errors if "errors" in dir() else []
-        created_str = data.get("created", "") if data else ""
-        if created_str:
-            try:
-                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                evt["response_time_ms"] = int((datetime.now(timezone.utc) - created_dt).total_seconds() * 1000)
-            except (ValueError, TypeError):
-                pass
+        created_ts = data.get("created") if data else None
+        if isinstance(created_ts, (int, float)):
+            evt["response_time_ms"] = int((time.time() - created_ts) * 1000)
     evt.update(cf)
     emit_monitor_event(evt)
 

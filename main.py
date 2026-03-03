@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import time
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -400,12 +401,14 @@ def _get_node_statuses() -> list[dict]:
 
     seen = {}
     for cid, entry in devices.items():
+        if not isinstance(entry, dict):
+            continue
         name = entry.get("name", cid[:8])
         if name not in seen or len(entry) > len(seen[name]):
             seen[name] = entry
 
     connected_agents = set(_agent_queues.keys())
-    now = datetime.now(timezone.utc)
+    now = int(time.time())
 
     nodes = []
     for name in sorted(seen.keys()):
@@ -413,13 +416,13 @@ def _get_node_statuses() -> list[dict]:
         has_sse = name in connected_agents
 
         hb_ts = _heartbeats.get(name)
-        heartbeat_ago = (now - hb_ts).total_seconds() if hb_ts else None
+        heartbeat_ago = (now - hb_ts) if hb_ts else None
 
         online = has_sse and (heartbeat_ago is None or heartbeat_ago < HEARTBEAT_STALE_SECONDS)
         nodes.append({
             "name": name,
             "status": "online" if online else "offline",
-            "last_seen": int(hb_ts.timestamp()) if hb_ts else None,
+            "last_seen": hb_ts,
             "aliases": entry.get("aliases", ""),
             "model": entry.get("model", ""),
             "os": entry.get("os", ""),
@@ -432,7 +435,7 @@ def _get_node_statuses() -> list[dict]:
 def _build_health_page() -> str:
     """Build the health status HTML page."""
     nodes = _get_node_statuses()
-    now = datetime.now(timezone.utc)
+    now = int(time.time())
 
     cards = []
     for node in nodes:
@@ -444,6 +447,8 @@ def _build_health_page() -> str:
         try:
             devices = json.loads(entry_path.read_text())
             for cid, e in devices.items():
+                if not isinstance(e, dict):
+                    continue
                 if e.get("name") == name:
                     entry = e
                     break
@@ -471,7 +476,7 @@ def _build_health_page() -> str:
             short_gpu = gpu.split("(")[0].strip() if len(gpu) > 40 else gpu
             details.append(f"GPU: <span>{html.escape(short_gpu)}</span>")
         if node["last_seen"] is not None:
-            ago = int(now.timestamp()) - node["last_seen"]
+            ago = now - node["last_seen"]
             if ago < 60:
                 ago_str = f"{ago}s ago"
             elif ago < 3600:
@@ -487,7 +492,7 @@ def _build_health_page() -> str:
             details="<br>".join(details),
         ))
 
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S UTC")
     return HEALTH_HTML.replace("{{NODES}}", "\n".join(cards)).replace("{{TIMESTAMP}}", timestamp)
 
 
