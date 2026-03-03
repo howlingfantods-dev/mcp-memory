@@ -341,7 +341,7 @@ def execute_task(mcp: MCPClient, task_id: str):
     # Verify it's for us (handle both 'target' and 'assigned_to')
     target = parse_task_field(content, "target") or parse_task_field(content, "assigned_to")
     target = target.lstrip("@")  # normalize @vps → vps
-    if target and target not in (AGENT_ID, "here"):
+    if target and target != AGENT_ID:
         logger.info("Task %s is for '%s', not us ('%s'). Skipping.", task_id, target, AGENT_ID)
         return
 
@@ -720,7 +720,7 @@ def check_pending_tasks(mcp: MCPClient):
                 content = mcp.read(filename)
                 status = parse_task_field(content, "status") or "pending"
                 target = parse_task_field(content, "target").lstrip("@")
-                if status == "pending" and (not target or target in (AGENT_ID, "here")):
+                if status == "pending" and (not target or target == AGENT_ID):
                     logger.info("Found pending task from before disconnect: %s", filename)
                     thread = threading.Thread(
                         target=execute_task,

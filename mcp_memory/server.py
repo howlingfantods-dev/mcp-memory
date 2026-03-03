@@ -225,7 +225,7 @@ async def create_task(target: str, request: str, task_type: str = "query",
     saves it, and sends an SSE notification to the target agent.
 
     Args:
-        target: Agent ID to dispatch to (e.g. "arch", "power", "here" for broadcast)
+        target: Agent ID to dispatch to (e.g. "arch", "power")
         request: What the agent should do
         task_type: Task type — "query" (default) or "code-edit"
         timeout: Max seconds for execution (default 120)
@@ -448,36 +448,11 @@ async def notify_agent(agent_id: str, id: str, ctx: Context = None) -> str:
     If the agent is offline, the task file remains pending and will be
     picked up when the agent reconnects.
 
-    Use agent_id="here" to broadcast to all connected agents.
-
     Args:
-        agent_id: Target agent ID (e.g. "thinkpad", "here" for all connected)
+        agent_id: Target agent ID (e.g. "thinkpad", "arch")
         id: Task filename (e.g. "ae4f2b.json")
     """
     task_id = id
-    # @here: broadcast to all connected agents
-    if agent_id == "here":
-        if not _agent_queues:
-            return "No agents are currently connected."
-        connected = list(_agent_queues.keys())
-        # Read the template task to clone per-agent
-        task_path = DATA_DIR / task_id
-        if not task_path.exists():
-            raise FileNotFoundError(f"Task file '{task_id}' not found.")
-        template = task_path.read_text()
-        results = []
-        for aid in connected:
-            agent_task_id = f"{uuid.uuid4()}.json"
-            data = json.loads(template)
-            data["target"] = aid
-            agent_content = json.dumps(data, indent=2)
-            agent_path = DATA_DIR / agent_task_id
-            agent_path.write_text(agent_content)
-            result = await notify_agent(aid, agent_task_id, ctx)
-            results.append(f"@{aid}: {result}")
-        # Remove the template task
-        task_path.unlink()
-        return f"Broadcast to {len(connected)} agents:\n" + "\n".join(results)
 
     # Verify agent is known (has heartbeat or SSE connection)
     if agent_id not in _heartbeats and agent_id not in _agent_queues:
@@ -657,3 +632,72 @@ async def await_task(id: str, timeout: int = 120, ctx: Context = None) -> str:
         preview = "\n".join(lines[-10:])
         return f"TIMEOUT (still {last_status}). Recent activity:\n{preview}"
     return f"TIMEOUT (still {last_status}). No thinking data available."
+
+
+@mcp.tool()
+async def ping_agents(timeout: int = 30, ctx: Context = None) -> str:
+    """Ping all connected agents and return response times.
+
+    Dispatches a simple ping task to every connected agent, waits for
+    responses, and returns a summary. Useful for verifying dispatch
+    from the current node.
+
+    Args:
+        timeout: Max seconds to wait for responses (default 30)
+    """
+    if not _agent_queues:
+        return "No agents connected."
+
+    connected = list(_agent_queues.keys())
+    now = int(time.time())
+    cf = _client_fields(ctx)
+    created_by = cf.get("device", "user")
+
+    # Create and dispatch a ping task per agent
+    task_ids = {}
+    for aid in connected:
+        task_id = f"{uuid.uuid4()}.json"
+        task = {
+            "title": "ping",
+            "status": "pending",
+            "type": "query",
+            "created": now,
+            "created_by": created_by,
+            "target": aid,
+            "timeout": timeout,
+            "request": "Reply with just the word 'pong' and nothing else.",
+            "allowed_commands": [],
+            "files": [],
+            "result": None,
+            "log": [{"ts": now, "agent": created_by, "msg": "ping"}],
+        }
+        path = _validate_filename(task_id)
+        path.write_text(json.dumps(task, indent=2))
+        _emit_task_event(task_id, json.dumps(task))
+        for q in _agent_queues.get(aid, set()):
+            await q.put(task_id)
+        task_ids[aid] = task_id
+
+    # Wait for all to complete
+    deadline = asyncio.get_event_loop().time() + timeout
+    results = {}
+    while task_ids and asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(1)
+        for aid, tid in list(task_ids.items()):
+            path = DATA_DIR / tid
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if data.get("status") in ("completed", "failed"):
+                elapsed = int(time.time()) - now
+                results[aid] = f"{elapsed}s - {data['status']}"
+                del task_ids[aid]
+
+    for aid in task_ids:
+        results[aid] = "timeout"
+
+    lines = [f"  @{aid}: {status}" for aid, status in sorted(results.items())]
+    return f"Pinged {len(connected)} agents:\n" + "\n".join(lines)
