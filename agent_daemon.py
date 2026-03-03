@@ -677,11 +677,6 @@ def heartbeat_loop(mcp: MCPClient, interval: int):
 
 # ── Cleanup old tasks ────────────────────────────────────────────────
 
-def _is_task_file(filename: str) -> bool:
-    """Check if filename looks like a UUID task (not a named memory file)."""
-    return filename.endswith(".json") and filename != "devices.json"
-
-
 def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
     """Delete completed/failed tasks older than max_age_hours."""
     try:
@@ -690,7 +685,7 @@ def cleanup_old_tasks(mcp: MCPClient, max_age_hours: int = 24):
             return
         for filename in file_list.splitlines():
             filename = filename.strip()
-            if not filename or not _is_task_file(filename):
+            if not filename:
                 continue
             try:
                 content = mcp.read(filename)
@@ -721,7 +716,7 @@ def check_pending_tasks(mcp: MCPClient):
             return
         for filename in file_list.splitlines():
             filename = filename.strip()
-            if not filename or not _is_task_file(filename):
+            if not filename:
                 continue
             try:
                 content = mcp.read(filename)
