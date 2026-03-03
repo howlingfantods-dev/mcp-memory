@@ -391,7 +391,7 @@ NODE_CARD = """<div class="node {status_class}">
 
 def _get_node_statuses() -> list[dict]:
     """Return status info for all registered nodes."""
-    devices_path = DATA_DIR / "devices.json"
+    devices_path = DATA_DIR / "agent-status.json"
     devices = {}
     if devices_path.exists():
         try:
@@ -441,7 +441,7 @@ def _build_health_page() -> str:
     for node in nodes:
         name = node["name"]
         status = node["status"]
-        entry_path = DATA_DIR / "devices.json"
+        entry_path = DATA_DIR / "agent-status.json"
         # Re-read full entry for hardware details
         entry = {}
         try:

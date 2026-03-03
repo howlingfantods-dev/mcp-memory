@@ -43,19 +43,22 @@ mcp = FastMCP(
 logger = logging.getLogger("mcp-memory")
 
 FILENAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+\.(md|json)$")
-DEVICES_FILE = DATA_DIR / "devices.json"
+PROTECTED_FILES = {"agent-status.json", "oauth.db"}
+DEVICES_FILE = DATA_DIR / "agent-status.json"
 
 def _next_event_id() -> str:
     return str(uuid.uuid4())
 
 
 
-def _validate_filename(filename: str) -> Path:
+def _validate_filename(filename: str, allow_protected: bool = False) -> Path:
     if not FILENAME_RE.match(filename):
         raise ValueError(
             f"Invalid filename '{filename}'. "
             "Must be alphanumeric/dashes/underscores with .md or .json extension."
         )
+    if not allow_protected and filename in PROTECTED_FILES:
+        raise ValueError(f"'{filename}' is managed internally and cannot be written via MCP tools.")
     path = (DATA_DIR / filename).resolve()
     if not str(path).startswith(str(DATA_DIR.resolve())):
         raise ValueError("Path traversal not allowed.")
@@ -104,7 +107,7 @@ def _client_fields(ctx: Context) -> dict:
         if entry.get("name"):
             fields["device"] = entry["name"]
         # Determine if this is a daemon or user session
-        # Daemon entries have a "daemon" field in devices.json
+        # Daemon entries have a "daemon" field in agent-status.json
         fields["is_daemon"] = bool(entry.get("daemon"))
     return fields
 
@@ -165,7 +168,7 @@ def read_memory(filename: str, ctx: Context = None) -> str:
     Args:
         filename: Name of the .md file to read (e.g. "MEMORY.md")
     """
-    path = _validate_filename(filename)
+    path = _validate_filename(filename, allow_protected=True)
     if not path.exists():
         raise FileNotFoundError(f"Memory file '{filename}' not found.")
     return path.read_text()
